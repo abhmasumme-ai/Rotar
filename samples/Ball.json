@@ -1,0 +1,16 @@
+{
+  "sport": "cricket",
+  "data_kind": "match-related-update",
+  "data": {
+    "matchkey": "a-rz--cricket--qA2103164696994676780",
+    "ball": {
+      "ball_key": 1055872,
+      "over": 14,
+      "batting_order": 2,
+      "is_delete": false
+    },
+    "push_reason": "NewOrLast",
+    "match_push_kind": "Ball",
+    "ts": 1793699434.884628
+  }
+}

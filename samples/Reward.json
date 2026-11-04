@@ -1,0 +1,11 @@
+{
+  "sport": "cricket",
+  "data_kind": "match-related-update",
+  "data": {
+    "matchkey": "a-rz--cricket--qA2103164696994676780",
+    "ball": null,
+    "push_reason": "Other",
+    "match_push_kind": "Reward",
+    "ts": 1793701648
+  }
+}
