@@ -26,14 +26,19 @@ OCR_SETTLE_MS = 400
 OCR_SCALE = 1.5
 PENDING_TIMEOUT_SEC = 3.0
 
-SHOT_DIR = Path("ocr_shots")     # সব স্ক্রিনশট এখানে সেভ হবে
+SHOT_DIR = Path("ocr_shots")
 SHOT_DIR.mkdir(exist_ok=True)
+
+# --- FIXED VIEWPORT (ei duita change korben na) ---
+VIEW_W = 1080
+VIEW_H = 920
+WIN_W = VIEW_W + 100      # browser window border/title bar soho
+WIN_H = VIEW_H + 120
 # ==========================================
 
 event_q = queue.Queue()
 ws_state = {"up": False}
 
-# {ball_key: {"map": {(over,delivery,side,line): (x,y)}, "png": Path}}
 shots = {}
 shots_lock = threading.Lock()
 
@@ -124,7 +129,6 @@ def setup_ocr():
 
 
 def ocr_measure_from_png(png_path):
-    """সংরক্ষিত PNG থেকে OCR ম্যাপ তৈরি করে।"""
     if not _ocr.get("ready"):
         return {}
     Image, ImageOps, pt = _ocr["Image"], _ocr["ImageOps"], _ocr["pt"]
@@ -187,7 +191,6 @@ def ocr_worker(ocr_page):
             if OCR_SETTLE_MS > 0:
                 ocr_page.wait_for_timeout(OCR_SETTLE_MS)
 
-            # ---- স্ক্রিনশট নাও, শুধু SHOT_DIR-এ সেভ ----
             ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time()*1000)%1000:03d}"
             safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", ball_key or "unknown")
             png_path = SHOT_DIR / f"ball_{safe_key}_{ts}.png"
@@ -299,7 +302,8 @@ def monitor_and_click():
         launch_kwargs = dict(
             headless=HEADLESS,
             args=[
-                "--start-maximized",
+                f"--window-size={WIN_W},{WIN_H}",
+                "--window-position=0,0",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--no-sandbox",
@@ -308,8 +312,9 @@ def monitor_and_click():
         if CHROME_PATH:
             launch_kwargs["executable_path"] = CHROME_PATH
         browser = p.chromium.launch(**launch_kwargs)
+
         context = browser.new_context(
-            no_viewport=True,
+            viewport={"width": VIEW_W, "height": VIEW_H},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -327,6 +332,7 @@ def monitor_and_click():
         page.goto(match_url)
         log(f"✅ [SETUP] Match page: {page.url}")
         log(f"📁 [SETUP] Screenshot folder: {SHOT_DIR.resolve()}")
+        log(f"🖥️  [SETUP] Fixed viewport: {VIEW_W}x{VIEW_H}")
 
         ocr_page = context.new_page()
         ocr_page.goto(match_url)
@@ -345,7 +351,6 @@ def monitor_and_click():
 
         try:
             while True:
-                # ---- pending 2nd push চেক ----
                 now = time.time()
                 with pending_lock:
                     items = list(pending)
@@ -378,7 +383,6 @@ def monitor_and_click():
                         with pending_lock:
                             pending.remove(it)
 
-                # ---- WS থেকে পুশ ----
                 try:
                     recv_ts, raw = event_q.get(timeout=0.5)
                 except queue.Empty:
@@ -407,7 +411,6 @@ def monitor_and_click():
                     other_match += 1
                     continue
 
-                # ---- ১ম পুশ ----
                 if push["kind"] == "first":
                     bkey = push["ball_key"]
                     if bkey:
@@ -417,7 +420,6 @@ def monitor_and_click():
                         log("⚠️  [PUSH-1] ball_key paoa jayni")
                     continue
 
-                # ---- delete ----
                 if push["kind"] == "delete":
                     bkey = push["ball_key"]
                     with shots_lock:
@@ -433,7 +435,6 @@ def monitor_and_click():
                     log(f"🗑️  [DELETE] ball={bkey} cleared")
                     continue
 
-                # ---- ২য় পুশ ----
                 if push["kind"] == "second":
                     bkey = push["ball_key"]
                     d = push["detail"]
@@ -479,7 +480,6 @@ def monitor_and_click():
                             })
                     continue
 
-                # ---- match push (ball chara) ----
                 log(f"ℹ️  [MATCH] push kind={data.get('match_push_kind', '-')} (skip)")
 
         except KeyboardInterrupt:
