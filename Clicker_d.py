@@ -37,9 +37,7 @@ WIN_H = VIEW_H + 120
 event_q = queue.Queue()
 ws_state = {"up": False}
 
-# OCR কাজ: (png_path, ball_key) — worker thread e pytesseract chalabe
 ocr_job_q = queue.Queue()
-# OCR ফল: {ball_key: {"map": {...}, "png": Path}}
 shots = {}
 shots_lock = threading.Lock()
 
@@ -49,6 +47,8 @@ pending_lock = threading.Lock()
 stop_evt = threading.Event()
 clicked_balls = set()
 clicked_lock = threading.Lock()
+
+last_innings = {"v": None}
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -98,10 +98,9 @@ def start_ws_thread():
     threading.Thread(target=lambda: asyncio.run(ws_loop()), daemon=True).start()
 
 
-# ---------- OCR (শুধু worker thread) ----------
+# ---------- OCR ----------
 _ocr = {"ready": False}
 
-# OCR ভুল সহনশীল: Over → Ov\w+, Delivery → Deli\w+
 CELL_PATTERN = re.compile(
     r"(\d{1,2})\s*[-–—~]?\s*Ov\w*\W*(\d{1,2})\s*[-–—~]?\s*Deli\w*"
     r"(?:\W*(Over|Under)\W*(\d+[.,]\d+))?",
@@ -133,7 +132,6 @@ def setup_ocr():
 
 
 def ocr_measure_from_png(png_path):
-    """শুধু worker thread থেকে কল হবে — Playwright নয়।"""
     if not _ocr.get("ready"):
         return {}
     Image, ImageOps, pt = _ocr["Image"], _ocr["ImageOps"], _ocr["pt"]
@@ -184,7 +182,6 @@ def ocr_measure_from_png(png_path):
 
 
 def ocr_worker():
-    """শুধু pytesseract — কোনো Playwright কল নেই।"""
     while not stop_evt.is_set():
         try:
             item = ocr_job_q.get(timeout=0.5)
@@ -204,51 +201,75 @@ def ocr_worker():
             log(f"⚠️ [OCR] error: {e}")
 
 
-# ---------- পুশ পার্সিং ----------
+# ---------- পুশ পার্সিং (আপনার প্রকৃত ফরম্যাট অনুযায়ী) ----------
 def parse_push(payload):
+    """
+    আপনার পুশ:
+      1st push: {"data": {"ball": {"ball_key":..,"over":..,"batting_order":..,"is_delete":false}, "matchkey":..}}
+      2nd push: {"data": {"ball": {"ball_key":.., "detail": {...}}, "matchkey":..}}
+      delete:   {"data": {"ball": {"ball_key":.., "is_delete":true}}}
+    """
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     if not isinstance(data, dict):
         return None
 
     ball = data.get("ball")
     if isinstance(ball, dict):
-        bkey = str(ball.get("ball_key") if ball.get("ball_key") is not None else "")
-        if ball.get("is_delete"):
+        raw_bkey = ball.get("ball_key")
+        bkey = str(raw_bkey) if raw_bkey is not None else ""
+
+        if ball.get("is_delete") is True:
             return {"kind": "delete", "ball_key": bkey, "data": data}
-        if isinstance(ball.get("detail"), dict):
-            return {"kind": "second", "ball_key": bkey, "data": data, "detail": ball["detail"]}
-        return {"kind": "first", "ball_key": bkey, "data": data}
+
+        detail = ball.get("detail")
+        if isinstance(detail, dict):
+            return {"kind": "second", "ball_key": bkey, "data": data, "detail": detail, "ball": ball}
+
+        return {"kind": "first", "ball_key": bkey, "data": data, "ball": ball}
 
     return {"kind": "match", "data": data}
 
 
 def ball_info(d):
+    """
+    আপনার detail ফরম্যাট অনুযায়ী রান/উইকেট/wide/no-ball বের করে।
+    Return: (text, kind, run)
+    """
     bt = str(d.get("ball_type") or "normal").lower()
 
-    if (d.get("team_score") or {}).get("is_wicket") or (d.get("bowler") or {}).get("is_wicket") or d.get("wicket"):
+    # wicket: team_score.is_wicket বা bowler.is_wicket বা d.wicket
+    ts = d.get("team_score") or {}
+    bw = d.get("bowler") or {}
+    if ts.get("is_wicket") or bw.get("is_wicket") or d.get("wicket"):
         return ("WICKET", "wicket", 0)
 
+    # no ball
     if re.search(r"no_?ball", bt):
         br = int((d.get("batsman") or {}).get("runs") or 0)
         return (f"NO BALL +{br}" if br > 0 else "NO BALL", "noball", 1 + br)
 
-    if (d.get("batsman") or {}).get("is_six"):
+    # six / four
+    bs = d.get("batsman") or {}
+    if bs.get("is_six"):
         return ("6", "six", 6)
-    if (d.get("batsman") or {}).get("is_four"):
+    if bs.get("is_four"):
         return ("4", "four", 4)
 
+    # wide
     if re.search(r"wide", bt):
-        wr = int((d.get("team_score") or {}).get("runs") or 1) - 1
+        wr = int(ts.get("runs") or 1) - 1
         return (f"WIDE +{wr}" if wr > 0 else "WIDE", "wide", 1 + wr)
 
-    r = (d.get("team_score") or {}).get("runs")
+    # normal run: team_score.runs
+    r = ts.get("runs")
     if r is None:
-        r = (d.get("batsman") or {}).get("runs") or 0
+        r = bs.get("runs") or 0
     r = int(r)
     return (str(r), "dot" if r == 0 else "run", r)
 
 
 def compute_target(d):
+    """detail.overs = [over0based, delivery] → (over_1based, delivery)"""
     ov = d.get("overs")
     if not isinstance(ov, list) or len(ov) < 2:
         return None
@@ -321,7 +342,6 @@ def monitor_and_click():
             ),
         )
 
-        # ---- একটাই page: স্ক্রিনশট ও ক্লিক দুইই এখানে ----
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page.goto(site_url)
@@ -335,7 +355,6 @@ def monitor_and_click():
         log(f"📁 [SETUP] Screenshot folder: {SHOT_DIR.resolve()}")
         log(f"🖥️  [SETUP] Fixed viewport: {VIEW_W}x{VIEW_H}")
 
-        # OCR worker (শুধু pytesseract)
         worker = threading.Thread(target=ocr_worker, daemon=True)
         worker.start()
 
@@ -348,7 +367,7 @@ def monitor_and_click():
 
         try:
             while True:
-                # ---- pending 2nd push ----
+                # ---- pending ----
                 now = time.time()
                 with pending_lock:
                     items = list(pending)
@@ -369,7 +388,6 @@ def monitor_and_click():
                             log(f"✅ [CLICK] ball={it['ball_key']} "
                                 f"({it['over']},{it['delivery']}) run={it['run']} "
                                 f"at ({xy[0]:.0f},{xy[1]:.0f}) [pending]")
-                            # ক্লিক সফল → PNG আর দরকার নেই
                             if sh and sh.get("png"):
                                 safe_remove(sh["png"])
                         except Exception as e:
@@ -379,13 +397,12 @@ def monitor_and_click():
                     elif now - it["t"] > PENDING_TIMEOUT_SEC:
                         log(f"⌛ [SKIP] ball={it['ball_key']} ({it['over']},{it['delivery']}) "
                             f"run={it['run']} — Under cell mile nai")
-                        if sm:
-                            if sh and sh.get("png"):
-                                safe_remove(sh["png"])
+                        if sh and sh.get("png"):
+                            safe_remove(sh["png"])
                         with pending_lock:
                             pending.remove(it)
 
-                # ---- WS পুশ ----
+                # ---- WS ----
                 try:
                     recv_ts, raw = event_q.get(timeout=0.5)
                 except queue.Empty:
@@ -414,7 +431,7 @@ def monitor_and_click():
                     other_match += 1
                     continue
 
-                # ---- ১ম পুশ: মূল থ্রেডে screenshot, তারপর worker-এ OCR ----
+                # ---- ১ম পুশ ----
                 if push["kind"] == "first":
                     bkey = push["ball_key"]
                     if not bkey:
@@ -429,7 +446,7 @@ def monitor_and_click():
                         raw_png = page.screenshot(type="png", scale="css")
                         with open(png_path, "wb") as f:
                             f.write(raw_png)
-                        log(f"💾 [PUSH-1] ball={bkey} screenshot saved: {png_path}")
+                        log(f"💾 [PUSH-1] ball={bkey} screenshot: {png_path}")
                         ocr_job_q.put((png_path, bkey))
                     except Exception as e:
                         log(f"⚠️ [PUSH-1] screenshot error: {e}")
@@ -442,16 +459,25 @@ def monitor_and_click():
                         sh = shots.pop(bkey, None)
                     with clicked_lock:
                         clicked_balls.discard(bkey)
-                    seen_second.discard(bkey)          # (3) fix
+                    seen_second.discard(bkey)
                     if sh and sh.get("png"):
                         safe_remove(sh["png"])
                     log(f"🗑️  [DELETE] ball={bkey} cleared")
                     continue
 
-                # ---- ২য় পুশ: result ----
+                # ---- ২য় পুশ ----
                 if push["kind"] == "second":
                     bkey = push["ball_key"]
                     d = push["detail"]
+
+                    # innings change হলে state clear
+                    inn = d.get("innings")
+                    if inn and inn != last_innings["v"]:
+                        last_innings["v"] = inn
+                        seen_second.clear()
+                        with pending_lock:
+                            pending.clear()
+                        log(f"🔄 [INNINGS] {inn} — state cleared")
 
                     if bkey in seen_second:
                         continue
@@ -478,7 +504,7 @@ def monitor_and_click():
                                 if bkey in clicked_balls:
                                     continue
                                 clicked_balls.add(bkey)
-                            try:                                   # (4) try/except
+                            try:
                                 page.mouse.click(*xy)
                                 ms = (time.time() - recv_ts) * 1000
                                 log(f"✅ [CLICK] ball={bkey} ({over},{delivery}) "
