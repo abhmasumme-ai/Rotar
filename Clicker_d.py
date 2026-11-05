@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import os
 import queue
@@ -22,30 +21,31 @@ HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 CHROME_PATH = os.environ.get("CLICKER_CHROME_PATH") or None
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or None
 
-OCR_SETTLE_MS = 400
 OCR_SCALE = 1.5
 PENDING_TIMEOUT_SEC = 3.0
 
 SHOT_DIR = Path("ocr_shots")
 SHOT_DIR.mkdir(exist_ok=True)
 
-# --- FIXED VIEWPORT (ei duita change korben na) ---
+# --- FIXED VIEWPORT ---
 VIEW_W = 1080
 VIEW_H = 920
-WIN_W = VIEW_W + 100      # browser window border/title bar soho
+WIN_W = VIEW_W + 100
 WIN_H = VIEW_H + 120
 # ==========================================
 
 event_q = queue.Queue()
 ws_state = {"up": False}
 
+# OCR কাজ: (png_path, ball_key) — worker thread e pytesseract chalabe
+ocr_job_q = queue.Queue()
+# OCR ফল: {ball_key: {"map": {...}, "png": Path}}
 shots = {}
 shots_lock = threading.Lock()
 
 pending = []
 pending_lock = threading.Lock()
 
-ocr_q = queue.Queue()
 stop_evt = threading.Event()
 clicked_balls = set()
 clicked_lock = threading.Lock()
@@ -72,7 +72,10 @@ async def ws_loop():
                 async def pinger():
                     while True:
                         await asyncio.sleep(PING_SEC)
-                        await ws.send("ping")
+                        try:
+                            await ws.send("ping")
+                        except Exception:
+                            break
 
                 ptask = asyncio.create_task(pinger())
                 try:
@@ -95,11 +98,12 @@ def start_ws_thread():
     threading.Thread(target=lambda: asyncio.run(ws_loop()), daemon=True).start()
 
 
-# ---------- OCR ----------
+# ---------- OCR (শুধু worker thread) ----------
 _ocr = {"ready": False}
 
+# OCR ভুল সহনশীল: Over → Ov\w+, Delivery → Deli\w+
 CELL_PATTERN = re.compile(
-    r"(\d{1,2})\s*[-–—~]?\s*Over\W*(\d{1,2})\s*[-–—~]?\s*Delivery"
+    r"(\d{1,2})\s*[-–—~]?\s*Ov\w*\W*(\d{1,2})\s*[-–—~]?\s*Deli\w*"
     r"(?:\W*(Over|Under)\W*(\d+[.,]\d+))?",
     re.I,
 )
@@ -129,6 +133,7 @@ def setup_ocr():
 
 
 def ocr_measure_from_png(png_path):
+    """শুধু worker thread থেকে কল হবে — Playwright নয়।"""
     if not _ocr.get("ready"):
         return {}
     Image, ImageOps, pt = _ocr["Image"], _ocr["ImageOps"], _ocr["pt"]
@@ -178,37 +183,23 @@ def ocr_measure_from_png(png_path):
     return result
 
 
-def ocr_worker(ocr_page):
+def ocr_worker():
+    """শুধু pytesseract — কোনো Playwright কল নেই।"""
     while not stop_evt.is_set():
         try:
-            item = ocr_q.get(timeout=0.5)
+            item = ocr_job_q.get(timeout=0.5)
         except queue.Empty:
             continue
         if item is None:
             break
-        reason, ball_key = item
+        png_path, ball_key = item
         try:
-            if OCR_SETTLE_MS > 0:
-                ocr_page.wait_for_timeout(OCR_SETTLE_MS)
-
-            ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time()*1000)%1000:03d}"
-            safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", ball_key or "unknown")
-            png_path = SHOT_DIR / f"ball_{safe_key}_{ts}.png"
-            raw = ocr_page.screenshot(type="png", scale="css")
-            with open(png_path, "wb") as f:
-                f.write(raw)
-            log(f"💾 [OCR] screenshot saved: {png_path}")
-
             t0 = time.time()
             m = ocr_measure_from_png(png_path)
             dt = (time.time() - t0) * 1000
-
-            if ball_key is not None:
-                with shots_lock:
-                    shots[ball_key] = {"map": m, "png": png_path}
-                log(f"📐 [OCR] ball={ball_key} map={len(m)} cells ({dt:.0f}ms)")
-            else:
-                log(f"📐 [OCR] map={len(m)} cells ({dt:.0f}ms)")
+            with shots_lock:
+                shots[ball_key] = {"map": m, "png": png_path}
+            log(f"📐 [OCR] ball={ball_key} map={len(m)} cells ({dt:.0f}ms)")
         except Exception as e:
             log(f"⚠️ [OCR] error: {e}")
 
@@ -290,10 +281,19 @@ def pick_click_cell(shot_map, over, delivery, run):
     return candidates[0][1]
 
 
+def safe_remove(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+            log(f"🗑️  [CLEAN] removed {path}")
+    except Exception:
+        pass
+
+
 # ---------- মূল লুপ ----------
 def monitor_and_click():
     match_filter = sys.argv[1].strip() if len(sys.argv) > 1 else ""
-    site_url = input("Site link din: ").strip() or "https://your website"
+    site_url = input("Site link din: ").strip() or "https://example.com"
 
     if not setup_ocr():
         return
@@ -321,6 +321,7 @@ def monitor_and_click():
             ),
         )
 
+        # ---- একটাই page: স্ক্রিনশট ও ক্লিক দুইই এখানে ----
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page.goto(site_url)
@@ -334,12 +335,8 @@ def monitor_and_click():
         log(f"📁 [SETUP] Screenshot folder: {SHOT_DIR.resolve()}")
         log(f"🖥️  [SETUP] Fixed viewport: {VIEW_W}x{VIEW_H}")
 
-        ocr_page = context.new_page()
-        ocr_page.goto(match_url)
-        ocr_page.wait_for_timeout(2000)
-        log("🖼️  [SETUP] OCR page ready")
-
-        worker = threading.Thread(target=ocr_worker, args=(ocr_page,), daemon=True)
+        # OCR worker (শুধু pytesseract)
+        worker = threading.Thread(target=ocr_worker, daemon=True)
         worker.start()
 
         start_ws_thread()
@@ -351,6 +348,7 @@ def monitor_and_click():
 
         try:
             while True:
+                # ---- pending 2nd push ----
                 now = time.time()
                 with pending_lock:
                     items = list(pending)
@@ -371,18 +369,23 @@ def monitor_and_click():
                             log(f"✅ [CLICK] ball={it['ball_key']} "
                                 f"({it['over']},{it['delivery']}) run={it['run']} "
                                 f"at ({xy[0]:.0f},{xy[1]:.0f}) [pending]")
+                            # ক্লিক সফল → PNG আর দরকার নেই
+                            if sh and sh.get("png"):
+                                safe_remove(sh["png"])
                         except Exception as e:
-                            log(f"⚠️ [CLICK] error: {e}")
-                            if page.is_closed():
-                                raise KeyboardInterrupt
+                            log(f"⚠️ [CLICK] pending error: {e}")
                         with pending_lock:
                             pending.remove(it)
                     elif now - it["t"] > PENDING_TIMEOUT_SEC:
                         log(f"⌛ [SKIP] ball={it['ball_key']} ({it['over']},{it['delivery']}) "
                             f"run={it['run']} — Under cell mile nai")
+                        if sm:
+                            if sh and sh.get("png"):
+                                safe_remove(sh["png"])
                         with pending_lock:
                             pending.remove(it)
 
+                # ---- WS পুশ ----
                 try:
                     recv_ts, raw = event_q.get(timeout=0.5)
                 except queue.Empty:
@@ -411,30 +414,41 @@ def monitor_and_click():
                     other_match += 1
                     continue
 
+                # ---- ১ম পুশ: মূল থ্রেডে screenshot, তারপর worker-এ OCR ----
                 if push["kind"] == "first":
                     bkey = push["ball_key"]
-                    if bkey:
-                        log(f"▶️  [PUSH-1] ball={bkey} — OCR trigger")
-                        ocr_q.put(("first_push", bkey))
-                    else:
+                    if not bkey:
                         log("⚠️  [PUSH-1] ball_key paoa jayni")
+                        continue
+
+                    ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time()*1000)%1000:03d}"
+                    safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", bkey)
+                    png_path = SHOT_DIR / f"ball_{safe_key}_{ts}.png"
+
+                    try:
+                        raw_png = page.screenshot(type="png", scale="css")
+                        with open(png_path, "wb") as f:
+                            f.write(raw_png)
+                        log(f"💾 [PUSH-1] ball={bkey} screenshot saved: {png_path}")
+                        ocr_job_q.put((png_path, bkey))
+                    except Exception as e:
+                        log(f"⚠️ [PUSH-1] screenshot error: {e}")
                     continue
 
+                # ---- delete ----
                 if push["kind"] == "delete":
                     bkey = push["ball_key"]
                     with shots_lock:
                         sh = shots.pop(bkey, None)
                     with clicked_lock:
                         clicked_balls.discard(bkey)
+                    seen_second.discard(bkey)          # (3) fix
                     if sh and sh.get("png"):
-                        try:
-                            os.remove(sh["png"])
-                            log(f"🗑️  [DELETE] ball={bkey} png removed: {sh['png']}")
-                        except Exception:
-                            pass
+                        safe_remove(sh["png"])
                     log(f"🗑️  [DELETE] ball={bkey} cleared")
                     continue
 
+                # ---- ২য় পুশ: result ----
                 if push["kind"] == "second":
                     bkey = push["ball_key"]
                     d = push["detail"]
@@ -464,15 +478,22 @@ def monitor_and_click():
                                 if bkey in clicked_balls:
                                     continue
                                 clicked_balls.add(bkey)
-                            page.mouse.click(*xy)
-                            ms = (time.time() - recv_ts) * 1000
-                            log(f"✅ [CLICK] ball={bkey} ({over},{delivery}) "
-                                f"run={run} at ({xy[0]:.0f},{xy[1]:.0f}) — {ms:.0f}ms")
+                            try:                                   # (4) try/except
+                                page.mouse.click(*xy)
+                                ms = (time.time() - recv_ts) * 1000
+                                log(f"✅ [CLICK] ball={bkey} ({over},{delivery}) "
+                                    f"run={run} at ({xy[0]:.0f},{xy[1]:.0f}) — {ms:.0f}ms")
+                                if sh and sh.get("png"):
+                                    safe_remove(sh["png"])
+                            except Exception as e:
+                                log(f"⚠️ [CLICK] error: {e}")
+                                if page.is_closed():
+                                    raise KeyboardInterrupt
                         else:
                             log(f"❌ [NO-CLICK] ball={bkey} ({over},{delivery}) run={run} — "
                                 f"Under cell mile nai")
                     else:
-                        log(f"⏳ [WAIT] ball={bkey} er 1st push screenshot nei — pending")
+                        log(f"⏳ [WAIT] ball={bkey} er OCR map nei — pending")
                         with pending_lock:
                             pending.append({
                                 "t": recv_ts, "ball_key": bkey,
@@ -486,7 +507,7 @@ def monitor_and_click():
             print("\nবন্ধ করা হচ্ছে...")
         finally:
             stop_evt.set()
-            ocr_q.put(None)
+            ocr_job_q.put(None)
             try:
                 browser.close()
             except Exception:
