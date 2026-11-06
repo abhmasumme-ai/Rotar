@@ -39,9 +39,11 @@ WIN_H = VIEW_H + 120
 event_q = queue.Queue()
 ws_state = {"up": False}
 
+# targets: list of {"rect":{x,y,w,h}, "over":.., "side":"over/under", "line":..}
 targets = []
 targets_lock = threading.Lock()
 
+# 1st maps: {ball_key: {"cells": [...], "png": str}}
 first_maps = {}
 first_lock = threading.Lock()
 
@@ -53,6 +55,10 @@ pending_lock = threading.Lock()
 stop_evt = threading.Event()
 used_points = {}
 used_lock = threading.Lock()
+
+# over ট্র্যাকিং — ওভার বদলালে ফাইল ক্লিন
+last_over = {"v": None}
+last_over_lock = threading.Lock()
 
 _ocr = {"ready": False}
 _ssim = {"ready": False}
@@ -271,6 +277,53 @@ def safe_remove(path):
         pass
 
 
+# ---------- ওভার শেষে ফাইল পরিষ্কার ----------
+def collect_keep_pngs():
+    """pending/1st_maps-এ থাকা বলের PNG (এগুলো মুছবে না)।"""
+    keep = set()
+    with first_lock:
+        for k, fm in first_maps.items():
+            if fm.get("png"):
+                keep.add(str(fm["png"]))
+            for c in fm.get("cells", []):
+                if c.get("crop1_png"):
+                    keep.add(str(c["crop1_png"]))
+    return keep
+
+
+def cleanup_shots_dir(keep_pngs=None):
+    if keep_pngs is None:
+        keep_pngs = set()
+    keep_strs = {str(p) for p in keep_pngs}
+    removed = 0
+    try:
+        for f in SHOT_DIR.glob("*.png"):
+            if str(f) in keep_strs:
+                continue
+            try:
+                f.unlink()
+                removed += 1
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"⚠️ [CLEANUP] error: {e}")
+    if removed:
+        log(f"🧹 [CLEANUP] {removed} files removed (over complete)")
+
+
+def check_over_change(new_over):
+    """ওভার নম্বর বদলালে পুরোনো ফাইল পরিষ্কার করে।"""
+    with last_over_lock:
+        old = last_over["v"]
+        if old is None:
+            last_over["v"] = new_over
+            return
+        if new_over != old:
+            last_over["v"] = new_over
+            keep = collect_keep_pngs()
+            cleanup_shots_dir(keep)
+
+
 # ---------- টার্গেট শেখানো ----------
 CLICK_HOOK_JS = """
 () => {
@@ -342,7 +395,7 @@ def learn_targets(page):
         doc_y = click["y"] + click["scrollY"]
         rect = {"x": doc_x - rw / 2, "y": doc_y - rh / 2, "w": rw, "h": rh}
 
-        over = delivery = None
+        over = None
         side = line = None
         try:
             raw = page.screenshot(type="png", scale="css")
@@ -362,12 +415,12 @@ def learn_targets(page):
             cell = parse_cell(text)
             if cell:
                 over, delivery, side, line = cell
-                print(f"✅ OCR: ({over},{delivery}) {side} {line} — {text!r}")
+                print(f"✅ OCR: over={over} {side} {line} — {text!r}")
             else:
                 s, l = parse_side_line(text)
                 if s and l is not None:
                     side, line = s, l
-                    print(f"⚠️ side/line peyechi ({side} {line}) kintu over/delivery nei")
+                    print(f"⚠️ side/line peyechi ({side} {line}) kintu over nei")
                 else:
                     print(f"⚠️ OCR e kichu mile nai: {text!r}")
         except Exception as e:
@@ -392,7 +445,7 @@ def learn_targets(page):
         with targets_lock:
             targets.append({
                 "rect": rect,
-                "over": over, "delivery": delivery,
+                "over": over,
                 "side": side, "line": line,
                 "label": label,
             })
@@ -419,7 +472,7 @@ def decide_side_line(run):
     return ("over", best)
 
 
-def pick_click_target(run, over, delivery):
+def pick_click_target(run, over):
     side, line = decide_side_line(run)
     with targets_lock:
         tlist = [dict(t) for t in targets]
@@ -428,7 +481,7 @@ def pick_click_target(run, over, delivery):
         t for t in tlist
         if t["side"] == side and t["line"] is not None
         and abs(t["line"] - line) < 0.01
-        and (t["over"] == over and t["delivery"] == delivery)
+        and (t["over"] == over)
     ]
     if exact:
         return exact[0]
@@ -477,7 +530,7 @@ def process_first_push(page, ball_key):
         if crop_from_png(png1, clip, crop_path):
             cells.append({
                 "rect": r,
-                "over": t["over"], "delivery": t["delivery"],
+                "over": t["over"],
                 "side": t["side"], "line": t["line"],
                 "crop1_png": str(crop_path),
             })
@@ -488,22 +541,22 @@ def process_first_push(page, ball_key):
 
 
 # ---------- ২য় পুশ ----------
-def process_second_push(page, ball_key, run, over, delivery):
+def process_second_push(page, ball_key, run, over):
     with first_lock:
         fm = first_maps.get(ball_key)
     if not fm:
         log(f"⏳ [PUSH-2] ball={ball_key} — ১ম map nei, pending")
         return False
 
-    target = pick_click_target(run, over, delivery)
+    target = pick_click_target(run, over)
     if not target:
         side, line = decide_side_line(run)
-        log(f"❌ [NO-CLICK] ball={ball_key} ({over},{delivery}) run={run} — "
+        log(f"❌ [NO-CLICK] ball={ball_key} over={over} run={run} — "
             f"{side} {line} target nei")
         return False
 
     side, line = decide_side_line(run)
-    log(f"🎯 [TARGET] ball={ball_key} ({over},{delivery}) run={run} → "
+    log(f"🎯 [TARGET] ball={ball_key} over={over} run={run} → "
         f"{side} {target['line']}")
 
     rect = target["rect"]
@@ -600,18 +653,18 @@ def ball_info(d):
 
 
 def compute_target(d):
+    """শুধু over নম্বর (1-based)।"""
     ov = d.get("overs")
     if not isinstance(ov, list) or len(ov) < 2:
         return None
     try:
-        return (int(ov[0]) + 1, int(ov[1]))
+        return int(ov[0]) + 1
     except (TypeError, ValueError):
         return None
 
 
 # ---------- Main ----------
 def monitor_and_click():
-    # match_key বাধ্যতামূলক
     if len(sys.argv) < 2 or not sys.argv[1].strip():
         print("\n❌ Roanuz match_key din!")
         print("   ব্যবহার: python script.py <match_key>")
@@ -622,7 +675,6 @@ def monitor_and_click():
     print("\n" + "=" * 60)
     print(f"🔑 [SETUP] match_key = {match_filter}")
     print("   শুধু এই ম্যাচের Ball-by-ball পুশ প্রসেস হবে।")
-    print("   অন্য ম্যাচের পুশ এড়িয়ে যাবে (heartbeat-এ other=N দেখাবে)।")
     print("=" * 60)
 
     site_url = input("\nSite link din: ").strip() or "https://example.com"
@@ -664,12 +716,9 @@ def monitor_and_click():
         page.goto(match_url)
         log(f"✅ [SETUP] Match page: {page.url}")
 
-        # URL সতর্কতা: match_filter-এর অংশ আছে কিনা
         key_head = match_filter.split("-")[0]
         if key_head and key_head not in match_url:
             log(f"⚠️ [WARN] URL e match_key ({match_filter}) er kono ongsho paoa jayni!")
-            log(f"   URL: {match_url}")
-            log(f"   ভুল ম্যাচের পেজ হতে পারে — যাচাই করুন।")
             ans = input("   তবুও চালিয়ে যাবেন? (y/n): ").strip().lower()
             if ans != "y":
                 browser.close()
@@ -677,7 +726,6 @@ def monitor_and_click():
         else:
             log(f"✓ [CHECK] URL e match_key er ongsho paoa gese")
 
-        # টার্গেট শেখানো
         learn_targets(page)
 
         if not targets:
@@ -685,7 +733,6 @@ def monitor_and_click():
             browser.close()
             return
 
-        # queue clear
         while not event_q.empty():
             try:
                 event_q.get_nowait()
@@ -714,8 +761,7 @@ def monitor_and_click():
                     if fm:
                         try:
                             process_second_push(
-                                page, it["ball_key"], it["run"],
-                                it["over"], it["delivery"]
+                                page, it["ball_key"], it["run"], it["over"]
                             )
                         except Exception as e:
                             log(f"⚠️ pending error: {e}")
@@ -723,6 +769,12 @@ def monitor_and_click():
                             pending.remove(it)
                     elif now - it["t"] > PENDING_TIMEOUT_SEC:
                         log(f"⌛ [SKIP] ball={it['ball_key']} — ১ম map nei")
+                        with first_lock:
+                            fm = first_maps.pop(it["ball_key"], None)
+                        if fm:
+                            safe_remove(fm.get("png"))
+                            for c in fm.get("cells", []):
+                                safe_remove(c.get("crop1_png"))
                         with pending_lock:
                             pending.remove(it)
 
@@ -732,9 +784,11 @@ def monitor_and_click():
                     if time.time() - last_event >= HEARTBEAT_SEC:
                         with pending_lock:
                             np = len(pending)
+                        with last_over_lock:
+                            lv = last_over["v"]
                         log(f"⏳ [HEARTBEAT] WS={'ON' if ws_state['up'] else 'OFF'} | "
                             f"targets={len(targets)} | first={len(first_maps)} | "
-                            f"pending={np} | other={other_match}")
+                            f"pending={np} | other={other_match} | last_over={lv}")
                         last_event = time.time()
                     continue
 
@@ -753,7 +807,6 @@ def monitor_and_click():
                 data = push["data"]
                 mkey = data.get("matchkey") or data.get("match_key") or data.get("key")
 
-                # ---- match_key ফিল্টার (বাধ্যতামূলক) ----
                 if mkey and mkey != match_filter:
                     other_match += 1
                     continue
@@ -762,7 +815,7 @@ def monitor_and_click():
                     bkey = push["ball_key"]
                     if not bkey:
                         continue
-                    log(f"▶️  [PUSH-1] ball={bkey} (match={mkey})")
+                    log(f"▶️  [PUSH-1] ball={bkey}")
                     try:
                         process_first_push(page, bkey)
                     except Exception as e:
@@ -790,18 +843,17 @@ def monitor_and_click():
                         continue
                     seen_second.add(bkey)
 
-                    tgt = compute_target(d)
-                    if not tgt:
+                    over = compute_target(d)
+                    if not over:
                         continue
-                    over, delivery = tgt
                     text, kind, run = ball_info(d)
-                    log(f"🏏 [PUSH-2] ball={bkey} ({over},{delivery}) {text} run={run}")
+                    log(f"🏏 [PUSH-2] ball={bkey} over={over} {text} run={run}")
 
                     with first_lock:
                         fm = first_maps.get(bkey)
                     if fm:
                         try:
-                            process_second_push(page, bkey, run, over, delivery)
+                            process_second_push(page, bkey, run, over)
                         except Exception as e:
                             log(f"⚠️ [PUSH-2] error: {e}")
                             if page.is_closed():
@@ -810,8 +862,12 @@ def monitor_and_click():
                         with pending_lock:
                             pending.append({
                                 "t": recv_ts, "ball_key": bkey,
-                                "over": over, "delivery": delivery, "run": run,
+                                "over": over, "run": run,
                             })
+
+                    # ---- ওভার বদলালে ফাইল পরিষ্কার ----
+                    check_over_change(over)
+
                     continue
 
                 log(f"ℹ️  [MATCH] push (skip)")
