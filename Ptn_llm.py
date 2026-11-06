@@ -8,12 +8,13 @@ import sys
 import threading
 import time
 import uuid
+import io
 from collections import OrderedDict
 from pathlib import Path
 
 import websockets
 from playwright.sync_api import sync_playwright
-import numpy as np # ⭐ র্যামে ছবি প্রসেস করার জন্য
+import numpy as np
 
 # ================= CONFIG =================
 WS_URL = "ws://127.0.0.1:5000/ws"
@@ -24,11 +25,7 @@ HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 CHROME_PATH = os.environ.get("CLICKER_CHROME_PATH") or None
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or None
 
-PENDING_TIMEOUT_SEC = 15.0
-STALE_MAP_TTL = 30.0
-REAP_INTERVAL = 5.0
-SEEN_SECOND_MAX = 300
-COMPARE_THRESHOLD = 0.65 # ক্যানভাস এবং ওডস পরিবর্তনের জন্য শিথিল
+COMPARE_THRESHOLD = 0.65 
 
 VIEW_W = 1080
 VIEW_H = 920
@@ -51,15 +48,12 @@ TARGET_PATTERNS = [
 event_q = queue.Queue()
 ws_state = {"up": False}
 
-first_maps = {}
-first_lock = threading.Lock()
 used_points = {}
 used_lock = threading.Lock()
 
 _ocr = {"ready": False}
 _ssim = {"ready": False}
 
-# ⭐ মেমোরিতে টেমপ্লেট রাখার জন্য ডিকশনারি (ডিস্ক নয়)
 TEMPLATES = {} 
 
 try:
@@ -95,24 +89,16 @@ def setup_engines():
 
 # ---------- Setup Mode (Runs ONCE) ----------
 def setup_templates(page):
-    """শুধুমাত্র একবার চলে। স্ক্রল করে বাটন খোঁজে এবং র্যামে টেমপ্লেট সেভ করে (কোনো ফাইল তৈরি হয় না)।"""
     print("\n🔍 [SETUP] বাটনগুলোর ছবি স্ক্যান করা হচ্ছে (RAM-Only Mode)...")
     page.mouse.move(VIEW_W // 2, VIEW_H // 2)
-    
-    for _ in range(10): page.mouse.wheel(0, -1000)
     page.wait_for_timeout(500)
 
     seen = set()
     cv2 = _ssim["cv2"]
     
     for attempt in range(10):
-        # ⭐ ডিস্কে সেভ না করে সরাসরি বাইট নেওয়া
         img_bytes = page.screenshot(type="png", scale="css")
-        np_arr = np.frombuffer(img_bytes, np.uint8)
-        src_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        
-        # PIL Image (OCR-এর জন্য)
-        img_pil = _ocr["Image"].open(Path(Path.cwd() / "dummy.png")) if False else _ocr["Image"].frombytes(img_bytes) 
+        img_pil = _ocr["Image"].open(io.BytesIO(img_bytes))
         
         data = _ocr["pt"].image_to_data(img_pil, config="--psm 11", output_type=_ocr["pt"].Output.DICT)
         
@@ -129,7 +115,6 @@ def setup_templates(page):
                     pad_x, pad_y = 40, 15
                     rect = {"x": max(0, x - pad_x), "y": max(0, y - pad_y), "w": w + pad_x*2, "h": h + pad_y*2}
                     
-                    # ⭐ র্যাম থেকে সরাসরি টার্গেট এরিয়া ক্রপ করা
                     crop_bytes = page.screenshot(type="png", scale="css", clip=rect)
                     crop_arr = np.frombuffer(crop_bytes, np.uint8)
                     tpl_img = cv2.imdecode(crop_arr, cv2.IMREAD_GRAYSCALE)
@@ -146,7 +131,6 @@ def setup_templates(page):
 
 # ---------- Live Mode (Ultra-Fast RAM-Only) ----------
 def fast_match_and_click(page, side, line, ball_key):
-    """খেলা চলাকালীন সরাসরি র্যাম থেকে OpenCV Template Matching করে (< 10ms)।"""
     tpl_data = TEMPLATES.get((side, line))
     if not tpl_data: return False
     
@@ -154,11 +138,9 @@ def fast_match_and_click(page, side, line, ball_key):
     tpl_img = tpl_data["img"]
     
     def try_match():
-        # ⭐ ডিস্কের বদলে সরাসরি র্যামে বাইট নিয়ে প্রসেস
         img_bytes = page.screenshot(type="png", scale="css")
         np_arr = np.frombuffer(img_bytes, np.uint8)
         src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
-        
         if src_img is None: return None
         
         res = cv2.matchTemplate(src_img, tpl_img, cv2.TM_CCOEFF_NORMED)
@@ -169,26 +151,42 @@ def fast_match_and_click(page, side, line, ball_key):
             return {"x": max_loc[0], "y": max_loc[1], "w": w, "h": h, "score": max_val}
         return None
 
-    # ১. বর্তমান স্ক্রিনে খুঁজবে
+    # ১. প্রথমে বর্তমান স্ক্রিনে খুঁজবে (যদি বাটন সেখানে থাকে)
     match = try_match()
     
-    # ২. না পেলে ২০০ পিক্সেল নিচে স্ক্রল করে খুঁজবে
+    # ২. না পেলে সামান্য উপরে স্ক্রল করে খুঁজবে
     if not match:
-        page.mouse.wheel(0, 200)
-        page.wait_for_timeout(50)
+        page.mouse.move(VIEW_W // 2, VIEW_H // 2) # মাউসকে মাঝখানে রাখা, যাতে স্ক্রল কাজ করে
+        page.mouse.wheel(0, -300)
+        page.wait_for_timeout(100)
         match = try_match()
         
-    # ৩. তাও না পেলে ৪০০ পিক্সেল উপরে স্ক্রল করে খুঁজবে
+    # ৩. তাও না পেলে সামান্য নিচে স্ক্রল করে খুঁজবে
     if not match:
-        page.mouse.wheel(0, -400)
-        page.wait_for_timeout(50)
+        page.mouse.wheel(0, 600)
+        page.wait_for_timeout(100)
         match = try_match()
+
+    # ৪. বাটন যদি আরও দূরে চলে যায়, তবে আরও কয়েক ধাপ নিচে স্ক্রল করে খুঁজবে
+    if not match:
+        for _ in range(3):
+            page.mouse.wheel(0, 300)
+            page.wait_for_timeout(100)
+            match = try_match()
+            if match: break
+            
+    # ৫. যদি উপরে চলে যায়, তবে আরও কয়েক ধাপ উপরে স্ক্রল করে খুঁজবে
+    if not match:
+        for _ in range(5):
+            page.mouse.wheel(0, -300)
+            page.wait_for_timeout(100)
+            match = try_match()
+            if match: break
 
     if match:
         log(f"   🎯 Found at ({match['x']},{match['y']}) score={match['score']:.3f}")
         do_human_click(page, ball_key, match)
         return True
-        
     return False
 
 # ---------- Human-like click ----------
@@ -243,13 +241,6 @@ def ball_info(d):
         return (f"WIDE +{wr}" if wr > 0 else "WIDE", "wide", 1 + wr)
     r = ts.get("runs") if ts.get("runs") is not None else (bs.get("runs") or 0)
     return (str(int(r)), "dot" if int(r) == 0 else "run", int(r))
-
-def compute_target(d):
-    ov = d.get("overs")
-    if isinstance(ov, list) and len(ov) >= 2:
-        try: return int(ov[0]) + 1
-        except: pass
-    return None
 
 def make_seen_lru(maxlen):
     od = OrderedDict()
@@ -313,11 +304,21 @@ def monitor_and_click():
         page.goto(match_url)
         log(f"✅ Match page: {page.url}")
 
-        # ⭐ ১. একবার স্ক্যান করে র্যামে টেমপ্লেট সেভ করা (Setup Phase)
+        print("\n" + "="*50)
+        print("👉 ব্রাউজারে গিয়ে ম্যানুয়ালি 'Quick Events' সিলেক্ট করুন।")
+        print("👉 স্ক্রিন রেডি হলে টার্মিনালে 'done' লিখে Enter দিন।")
+        print("="*50 + "\n")
+        
+        while True:
+            ans = input("টার্মিনালে 'done' লিখুন: ").strip().lower()
+            if ans == "done": break
+            print("শুধু 'done' লিখুন।")
+
+        log("▶️ স্ক্যানিং শুরু হচ্ছে...")
         setup_templates(page)
         
         if not TEMPLATES:
-            log("❌ কোনো টেমপ্লেট পাওয়া যায়নি। কোড বন্ধ করা হচ্ছে।")
+            log("❌ কোনো টেমপ্লেট পাওয়া যায়নি। কোড বন্ধ করা হচ্ছে।")
             browser.close(); return
 
         while not event_q.empty():
@@ -327,7 +328,7 @@ def monitor_and_click():
         start_ws_thread()
         log(f"👂 [WS] wait korchi... (match={match_filter})\n")
 
-        remember_seen, was_seen, forget_seen = make_seen_lru(SEEN_SECOND_MAX)
+        remember_seen, was_seen, forget_seen = make_seen_lru(300)
         last_event, other_match = time.time(), 0
 
         try:
@@ -357,14 +358,11 @@ def monitor_and_click():
                     remember_seen(bkey)
                     
                     text, kind, run = ball_info(d)
-                    
-                    # ⭐ ২. রান অনুযায়ী সাইড ও লাইন ঠিক করা (Ultra Fast)
                     side, line = ("under", 0.5) if run == 0 else ("over", max([ln for ln in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5] if run > ln], default=0.5))
                     log(f"🏏 [PUSH-2] run={run} → {side} {line}")
                     
-                    # ⭐ ৩. সরাসরি র্যাম থেকে ছবি ম্যাচ করে ক্লিক করা (No OCR, No Disk)
                     if not fast_match_and_click(page, side, line, bkey):
-                        log(f"❌ [NO-CLICK] {side} {line} বাটনটি স্ক্রিনে পাওয়া যায়নি।")
+                        log(f"❌ [NO-CLICK] {side} {line} বাটনটি স্ক্রিনে পাওয়া যায়নি।")
                     continue
 
         except KeyboardInterrupt:
