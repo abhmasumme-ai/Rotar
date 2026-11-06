@@ -87,33 +87,80 @@ def setup_engines():
         return False
     return True
 
-# ---------- Setup Mode (Runs ONCE) ----------
+# ---------- Setup Mode (Exact Regex Row Grouping) ----------
 def setup_templates(page):
-    print("\n🔍 [SETUP] বাটনগুলোর ছবি স্ক্যান করা হচ্ছে (RAM-Only Mode)...")
+    print("\n🔍 [SETUP] Exact Pattern স্ক্যান করা হচ্ছে...")
     page.mouse.move(VIEW_W // 2, VIEW_H // 2)
     page.wait_for_timeout(500)
 
     seen = set()
     cv2 = _ssim["cv2"]
     
-    for attempt in range(10):
+    # কঠোর রেগুলার এক্সপ্রেশন (শুধু এই ফরম্যাটটাই ধরবে)
+    # উদাহরণ: 17 - Over, 3 - Delivery, Over 0.5
+    strict_regex = r"(\d+)\s*-\s*Over,\s*(\d+)\s*-\s*Delivery,\s*(Over|Under)\s*(\d+(?:\.\d+)?)"
+    
+    for attempt in range(5):
         img_bytes = page.screenshot(type="png", scale="css")
         img_pil = _ocr["Image"].open(io.BytesIO(img_bytes))
         
+        # get data with coordinates
         data = _ocr["pt"].image_to_data(img_pil, config="--psm 11", output_type=_ocr["pt"].Output.DICT)
         
+        # ১. লাইন অনুযায়ী টেক্সট গ্রুপ করা (Row Grouping)
+        rows = {}
         for i in range(len(data['text'])):
-            text = str(data['text'][i]).strip().lower()
+            text = str(data['text'][i]).strip()
             if not text: continue
+            y_center = data['top'][i] + data['height'][i] / 2
+            row_key = round(y_center / 10) * 10  # ১০ পিক্সেল কাছাকাছি হলে একই লাইন ধরা হবে
             
-            for t in TARGET_PATTERNS:
-                side, line = t["side"], t["line"]
-                if (side, line) in seen: continue
+            if row_key not in rows: rows[row_key] = []
+            rows[row_key].append(i)
+            
+        for row_key, indices in rows.items():
+            indices.sort(key=lambda i: data['left'][i])
+            
+            # লাইনটির সম্পূর্ণ টেক্সট বানানো
+            full_text = ""
+            word_start_indices = []
+            for i in indices:
+                word = str(data['text'][i]).strip()
+                if not word: continue
+                word_start_indices.append((len(full_text), i))
+                full_text += word + " "
                 
-                if side in text and str(line) in text:
-                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    pad_x, pad_y = 40, 15
-                    rect = {"x": max(0, x - pad_x), "y": max(0, y - pad_y), "w": w + pad_x*2, "h": h + pad_y*2}
+            # ২. Exact Regex Match
+            match = re.search(strict_regex, full_text, re.IGNORECASE)
+            if match:
+                side = match.group(3).lower()
+                line = float(match.group(4))
+                
+                # চেক করা এটি আমাদের টার্গেট লিস্টে আছে কি না
+                is_target = False
+                for t in TARGET_PATTERNS:
+                    if t["side"] == side and abs(t["line"] - line) < 0.01:
+                        is_target = True
+                        break
+                
+                if is_target and (side, line) not in seen:
+                    matched_str = match.group(0)
+                    
+                    # ৩. শুধু টেক্সট এরিয়ার বাউন্ডিং বক্স বের করা (ওডস বাদ দেওয়ার জন্য)
+                    valid_indices = []
+                    for start_idx, word_idx in word_start_indices:
+                        if start_idx < len(matched_str):
+                            valid_indices.append(word_idx)
+                            
+                    if not valid_indices: continue
+                    
+                    min_x = min(data['left'][i] for i in valid_indices)
+                    max_x = max(data['left'][i] + data['width'][i] for i in valid_indices)
+                    min_y = min(data['top'][i] for i in valid_indices)
+                    max_y = max(data['top'][i] + data['height'][i] for i in valid_indices)
+                    
+                    pad_x, pad_y = 5, 3
+                    rect = {"x": max(0, min_x - pad_x), "y": max(0, min_y - pad_y), "w": (max_x - min_x) + pad_x*2, "h": (max_y - min_y) + pad_y*2}
                     
                     crop_bytes = page.screenshot(type="png", scale="css", clip=rect)
                     crop_arr = np.frombuffer(crop_bytes, np.uint8)
@@ -121,16 +168,14 @@ def setup_templates(page):
                     
                     TEMPLATES[(side, line)] = {"img": tpl_img}
                     seen.add((side, line))
-                    log(f"   ✅ Saved template for {side} {line} in RAM")
+                    log(f"   ✅ Exact Match: '{matched_str}' -> {side} {line}")
         
-        if len(seen) == len(TARGET_PATTERNS): break
+        if len(seen) >= 2: break
         page.mouse.wheel(0, 400)
         page.wait_for_timeout(300)
-        
-    print(f"✅ [SETUP] শেষ। {len(TEMPLATES)}টি বাটন র্যামে ম্যাপ করা হয়েছে।\n")
 
-# ---------- Live Mode (Ultra-Fast RAM-Only) ----------
-def fast_match_and_click(page, side, line, ball_key):
+# ---------- Live Mode ----------
+def fast_match_and_click(page, side, line, ball_key, current_over):
     tpl_data = TEMPLATES.get((side, line))
     if not tpl_data: return False
     
@@ -151,42 +196,29 @@ def fast_match_and_click(page, side, line, ball_key):
             return {"x": max_loc[0], "y": max_loc[1], "w": w, "h": h, "score": max_val}
         return None
 
-    # ১. প্রথমে বর্তমান স্ক্রিনে খুঁজবে (যদি বাটন সেখানে থাকে)
     match = try_match()
     
-    # ২. না পেলে সামান্য উপরে স্ক্রল করে খুঁজবে
+    # স্ক্রল করে খোঁজা (যদি স্ক্রিনের বাইরে থাকে)
     if not match:
-        page.mouse.move(VIEW_W // 2, VIEW_H // 2) # মাউসকে মাঝখানে রাখা, যাতে স্ক্রল কাজ করে
+        page.mouse.move(VIEW_W // 2, VIEW_H // 2)
         page.mouse.wheel(0, -300)
         page.wait_for_timeout(100)
         match = try_match()
-        
-    # ৩. তাও না পেলে সামান্য নিচে স্ক্রল করে খুঁজবে
     if not match:
         page.mouse.wheel(0, 600)
         page.wait_for_timeout(100)
         match = try_match()
 
-    # ৪. বাটন যদি আরও দূরে চলে যায়, তবে আরও কয়েক ধাপ নিচে স্ক্রল করে খুঁজবে
-    if not match:
-        for _ in range(3):
-            page.mouse.wheel(0, 300)
-            page.wait_for_timeout(100)
-            match = try_match()
-            if match: break
-            
-    # ৫. যদি উপরে চলে যায়, তবে আরও কয়েক ধাপ উপরে স্ক্রল করে খুঁজবে
-    if not match:
-        for _ in range(5):
-            page.mouse.wheel(0, -300)
-            page.wait_for_timeout(100)
-            match = try_match()
-            if match: break
-
     if match:
         log(f"   🎯 Found at ({match['x']},{match['y']}) score={match['score']:.3f}")
         do_human_click(page, ball_key, match)
         return True
+        
+    # ⭐ Self-Healing: যদি ওভার পরিবর্তন হয়ে যায় (যেমন ১৭ থেকে ১৮), তবে ছবি মিলবে না। তখন রিস্ক্যান করবে।
+    if current_over:
+        log(f"🔄 [RESCAN] Over {current_over} এর জন্য নতুন করে স্ক্যান করা হচ্ছে...")
+        setup_templates(page)
+        
     return False
 
 # ---------- Human-like click ----------
@@ -241,6 +273,13 @@ def ball_info(d):
         return (f"WIDE +{wr}" if wr > 0 else "WIDE", "wide", 1 + wr)
     r = ts.get("runs") if ts.get("runs") is not None else (bs.get("runs") or 0)
     return (str(int(r)), "dot" if int(r) == 0 else "run", int(r))
+
+def compute_target(d):
+    ov = d.get("overs")
+    if isinstance(ov, list) and len(ov) >= 2:
+        try: return int(ov[0]) + 1
+        except: pass
+    return None
 
 def make_seen_lru(maxlen):
     od = OrderedDict()
@@ -312,24 +351,25 @@ def monitor_and_click():
         while True:
             ans = input("টার্মিনালে 'done' লিখুন: ").strip().lower()
             if ans == "done": break
-            print("শুধু 'done' লিখুন।")
 
         log("▶️ স্ক্যানিং শুরু হচ্ছে...")
-        setup_templates(page)
         
-        if not TEMPLATES:
-            log("❌ কোনো টেমপ্লেট পাওয়া যায়নি। কোড বন্ধ করা হচ্ছে।")
-            browser.close(); return
+        while not TEMPLATES:
+            setup_templates(page)
+            if not TEMPLATES:
+                log("⚠️ এখনো কোনো Exact Pattern পাওয়া যায়নি (মার্কেট সাসপেন্ড হতে পারে)।")
+                log("🔄 ৫ সেকেন্ড পর আবার স্ক্যান করা হবে... (বন্ধ করতে Ctrl+C চাপুন)")
+                time.sleep(5)
 
         while not event_q.empty():
             try: event_q.get_nowait()
             except queue.Empty: break
 
         start_ws_thread()
-        log(f"👂 [WS] wait korchi... (match={match_filter})\n")
+        log(f"👂 [WS] wait korchi...\n")
 
         remember_seen, was_seen, forget_seen = make_seen_lru(300)
-        last_event, other_match = time.time(), 0
+        last_event = time.time()
 
         try:
             while True:
@@ -349,7 +389,7 @@ def monitor_and_click():
 
                 data = push["data"]
                 mkey = data.get("matchkey") or data.get("match_key") or data.get("key")
-                if mkey and mkey != match_filter: other_match += 1; continue
+                if mkey and mkey != match_filter: continue
 
                 if push["kind"] == "second":
                     bkey = push["ball_key"]
@@ -359,9 +399,11 @@ def monitor_and_click():
                     
                     text, kind, run = ball_info(d)
                     side, line = ("under", 0.5) if run == 0 else ("over", max([ln for ln in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5] if run > ln], default=0.5))
+                    current_over = compute_target(d)
+                    
                     log(f"🏏 [PUSH-2] run={run} → {side} {line}")
                     
-                    if not fast_match_and_click(page, side, line, bkey):
+                    if not fast_match_and_click(page, side, line, bkey, current_over):
                         log(f"❌ [NO-CLICK] {side} {line} বাটনটি স্ক্রিনে পাওয়া যায়নি।")
                     continue
 
