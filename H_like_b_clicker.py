@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 
 import websockets
@@ -24,11 +25,14 @@ CHROME_PATH = os.environ.get("CLICKER_CHROME_PATH") or None
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or None
 
 OCR_SCALE = 1.0
-PENDING_TIMEOUT_SEC = 10.0
+PENDING_TIMEOUT_SEC = 10.0     # ২য় পুশ আসার অপেক্ষায় ১ম map কতক্ষণ রাখব
+STALE_MAP_TTL = 30.0           # ১ম map যার ২য় পুশ আসেইনি, কতক্ষণ পর reaper মুছবে
+REAP_INTERVAL = 5.0            # প্রতি কত সেকেন্ডে reaper চলবে
+SEEN_SECOND_MAX = 300          # LRU-তে সর্বোচ্চ কত ball_key রাখব (dedup)
 COMPARE_THRESHOLD = 0.82
 
 SHOT_DIR = Path("ocr_shots")
-SHOT_DIR.mkdir(exist_ok=True)
+SHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 VIEW_W = 1080
 VIEW_H = 920
@@ -43,7 +47,7 @@ ws_state = {"up": False}
 targets = []
 targets_lock = threading.Lock()
 
-# 1st maps: {ball_key: {"cells": [...], "png": str}}
+# first_maps: {ball_key: {"cells": [...], "png": str, "ts": float}}
 first_maps = {}
 first_lock = threading.Lock()
 
@@ -75,15 +79,17 @@ def log(msg):
 
 # ---------- WebSocket ----------
 async def ws_loop():
-    while True:
+    while not stop_evt.is_set():
         err = None
         try:
-            async with websockets.connect(WS_URL, ping_interval=None, compression=None, max_size=None) as ws:
+            async with websockets.connect(
+                WS_URL, ping_interval=None, compression=None, max_size=None
+            ) as ws:
                 ws_state["up"] = True
                 log(f"🔌 [WS] connected: {WS_URL}")
 
                 async def pinger():
-                    while True:
+                    while not stop_evt.is_set():
                         await asyncio.sleep(PING_SEC)
                         try:
                             await ws.send("ping")
@@ -103,6 +109,8 @@ async def ws_loop():
         if ws_state["up"]:
             log("🔌 [WS] disconnected")
         ws_state["up"] = False
+        if stop_evt.is_set():
+            break
         log(f"🔄 [WS] {RECONNECT_SEC}s pore reconnect... ({err or 'closed'})")
         await asyncio.sleep(RECONNECT_SEC)
 
@@ -161,7 +169,9 @@ def ocr_text_from_png(png_path, psm=7):
     img = Image.open(png_path)
     g = ImageOps.autocontrast(img.convert("L"))
     if OCR_SCALE != 1:
-        g = g.resize((int(g.width * OCR_SCALE), int(g.height * OCR_SCALE)), Image.LANCZOS)
+        g = g.resize(
+            (int(g.width * OCR_SCALE), int(g.height * OCR_SCALE)), Image.LANCZOS
+        )
     return pt.image_to_string(g, config=f"--psm {psm}")
 
 
@@ -201,8 +211,10 @@ def crop_from_png(png_path, rect, out_path):
     Image = _ocr["Image"]
     img = Image.open(png_path)
     x, y, w, h = int(rect["x"]), int(rect["y"]), int(rect["w"]), int(rect["h"])
-    x = max(0, x); y = max(0, y)
-    w = max(1, w); h = max(1, h)
+    x = max(0, x)
+    y = max(0, y)
+    w = max(1, w)
+    h = max(1, h)
     img.crop((x, y, x + w, y + h)).save(out_path)
     return True
 
@@ -264,7 +276,10 @@ def do_human_click(page, ball_key, rect):
         page.mouse.down()
         page.wait_for_timeout(random.randint(15, 40))
         page.mouse.up()
-        log(f"✅ [CLICK] ball={ball_key} at ({px:.0f},{py:.0f}) rect=({x:.0f},{y:.0f},{w},{h})")
+        log(
+            f"✅ [CLICK] ball={ball_key} at ({px:.0f},{py:.0f}) "
+            f"rect=({x:.0f},{y:.0f},{w},{h})"
+        )
     except Exception as e:
         log(f"⚠️ [CLICK] error: {e}")
 
@@ -277,12 +292,12 @@ def safe_remove(path):
         pass
 
 
-# ---------- ওভার শেষে ফাইল পরিষ্কার ----------
+# ---------- ফাইল পরিষ্কার ----------
 def collect_keep_pngs():
-    """pending/1st_maps-এ থাকা বলের PNG (এগুলো মুছবে না)।"""
+    """first_maps-এ থাকা বলের PNG (এগুলো মুছবে না)।"""
     keep = set()
     with first_lock:
-        for k, fm in first_maps.items():
+        for _, fm in first_maps.items():
             if fm.get("png"):
                 keep.add(str(fm["png"]))
             for c in fm.get("cells", []):
@@ -463,25 +478,31 @@ def decide_side_line(run):
     if run == 0:
         return ("under", 0.5)
     known_lines = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
-    best = None
-    for ln in known_lines:
-        if run > ln:
-            best = ln
-    if best is None:
-        best = 0.5
+    best = max([ln for ln in known_lines if run > ln], default=0.5)
     return ("over", best)
 
 
 def pick_click_target(run, over):
     side, line = decide_side_line(run)
     with targets_lock:
-        tlist = [dict(t) for t in targets]
+        # deepcopy-ish: rect সব dict গুলো কপি
+        tlist = [
+            {
+                "rect": dict(t["rect"]),
+                "over": t["over"],
+                "side": t["side"],
+                "line": t["line"],
+                "label": t.get("label"),
+            }
+            for t in targets
+        ]
 
+    # over ফিল্ড 0-based (OCR) আর args 1-based হতে পারে → None হলে wildcard
     exact = [
         t for t in tlist
         if t["side"] == side and t["line"] is not None
         and abs(t["line"] - line) < 0.01
-        and (t["over"] == over)
+        and (t["over"] is None or t["over"] == over)
     ]
     if exact:
         return exact[0]
@@ -520,12 +541,21 @@ def process_first_push(page, ball_key):
     sx, sy = scroll["x"], scroll["y"]
 
     with targets_lock:
-        tlist = [dict(t) for t in targets]
+        tlist = [
+            {
+                "rect": dict(t["rect"]),
+                "over": t["over"],
+                "side": t["side"],
+                "line": t["line"],
+            }
+            for t in targets
+        ]
 
     cells = []
     for i, t in enumerate(tlist):
         r = t["rect"]
-        clip = {"x": r["x"] - sx, "y": r["y"] - sy, "width": r["w"], "height": r["h"]}
+        clip = {"x": r["x"] - sx, "y": r["y"] - sy,
+                "width": r["w"], "height": r["h"]}
         crop_path = SHOT_DIR / f"crop1_{safe}_t{i}_{uid}.png"
         if crop_from_png(png1, clip, crop_path):
             cells.append({
@@ -536,8 +566,24 @@ def process_first_push(page, ball_key):
             })
 
     with first_lock:
-        first_maps[ball_key] = {"cells": cells, "png": str(png1)}
+        first_maps[ball_key] = {
+            "cells": cells,
+            "png": str(png1),
+            "ts": time.time(),
+        }
     log(f"   🗺️  {len(cells)} cells mapped")
+
+
+def _drop_first_map(ball_key):
+    """first_maps এন্ট্রি ও তার সব ফাইল মুছে দেয়।"""
+    with first_lock:
+        fm = first_maps.pop(ball_key, None)
+    if fm:
+        safe_remove(fm.get("png"))
+        for c in fm.get("cells", []):
+            safe_remove(c.get("crop1_png"))
+    with used_lock:
+        used_points.pop(ball_key, None)
 
 
 # ---------- ২য় পুশ ----------
@@ -555,9 +601,9 @@ def process_second_push(page, ball_key, run, over):
             f"{side} {line} target nei")
         return False
 
-    side, line = decide_side_line(run)
+    side_want, line_want = decide_side_line(run)
     log(f"🎯 [TARGET] ball={ball_key} over={over} run={run} → "
-        f"{side} {target['line']}")
+        f"{side_want} {target['line']}")
 
     rect = target["rect"]
     match_cell = None
@@ -578,8 +624,9 @@ def process_second_push(page, ball_key, run, over):
     uid = uuid.uuid4().hex[:8]
 
     r = match_cell["rect"]
-    clip = {"x": r["x"] - sx, "y": r["y"] - sy, "width": r["w"], "height": r["h"]}
-    crop2 = SHOT_DIR / f"crop2_{re.sub(r'[^A-Za-z0-9_-]','_',ball_key)}_{uid}.png"
+    clip = {"x": r["x"] - sx, "y": r["y"] - sy,
+            "width": r["w"], "height": r["h"]}
+    crop2 = SHOT_DIR / f"crop2_{re.sub(r'[^A-Za-z0-9_-]', '_', ball_key)}_{uid}.png"
     try:
         raw = page.screenshot(type="png", scale="css", clip=clip)
         with open(crop2, "wb") as f:
@@ -598,11 +645,9 @@ def process_second_push(page, ball_key, run, over):
         vx = r["x"] - sx
         vy = r["y"] - sy
         do_human_click(page, ball_key, {"x": vx, "y": vy, "w": r["w"], "h": r["h"]})
-        safe_remove(match_cell["crop1_png"])
+        # সব cell এর crop + মূল png + used_points মুছে দাও
         safe_remove(str(crop2))
-        safe_remove(fm["png"])
-        with first_lock:
-            first_maps.pop(ball_key, None)
+        _drop_first_map(ball_key)
         return True
     else:
         log(f"❌ [NO-CLICK] ball={ball_key} compare fail score={score:.3f}")
@@ -623,7 +668,8 @@ def parse_push(payload):
             return {"kind": "delete", "ball_key": bkey, "data": data}
         detail = ball.get("detail")
         if isinstance(detail, dict):
-            return {"kind": "second", "ball_key": bkey, "data": data, "detail": detail}
+            return {"kind": "second", "ball_key": bkey, "data": data,
+                    "detail": detail}
         return {"kind": "first", "ball_key": bkey, "data": data}
     return {"kind": "match", "data": data}
 
@@ -653,14 +699,47 @@ def ball_info(d):
 
 
 def compute_target(d):
-    """শুধু over নম্বর (1-based)।"""
+    """over নম্বর (1-based)। d = ball.detail।"""
+    if not isinstance(d, dict):
+        return None
     ov = d.get("overs")
-    if not isinstance(ov, list) or len(ov) < 2:
-        return None
-    try:
-        return int(ov[0]) + 1
-    except (TypeError, ValueError):
-        return None
+    if isinstance(ov, list) and len(ov) >= 2:
+        try:
+            return int(ov[0]) + 1
+        except (TypeError, ValueError):
+            pass
+    # fallback: display_score string
+    ds = d.get("display_score")
+    if isinstance(ds, str):
+        m = re.search(r"in\s+([\d.]+)\s+overs?", ds, re.I)
+        if m:
+            try:
+                return int(m.group(1).split(".")[0]) + 1
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
+# ---------- Dedup helper (LRU) ----------
+def make_seen_lru(maxlen):
+    """bounded set: পুরনো ball_key ছুড়ে ফেলে, নতুন রাখে।"""
+    od = OrderedDict()
+
+    def remember(k):
+        if k in od:
+            od.move_to_end(k)
+        else:
+            od[k] = True
+        while len(od) > maxlen:
+            od.popitem(last=False)
+
+    def contains(k):
+        return k in od
+
+    def discard(k):
+        od.pop(k, None)
+
+    return remember, contains, discard
 
 
 # ---------- Main ----------
@@ -705,7 +784,9 @@ def monitor_and_click():
         )
 
         page = context.new_page()
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
         page.goto(site_url)
         print("\n=== ম্যানুয়ালি লগইন করুন ===")
         print("(ব্রাউজারে লগইন শেষে টার্মিনালে ফিরে আসুন)\n")
@@ -746,13 +827,18 @@ def monitor_and_click():
         start_ws_thread()
         log(f"👂 [WS] wait korchi... (match_key={match_filter})\n")
 
+        # 2nd push dedup — bounded LRU
+        remember_seen, was_seen, forget_seen = make_seen_lru(SEEN_SECOND_MAX)
+
         last_event = time.time()
+        last_reap = time.time()
         other_match = 0
-        seen_second = set()
 
         try:
             while True:
                 now = time.time()
+
+                # ===== 1) pending processing =====
                 with pending_lock:
                     items = list(pending)
                 for it in items:
@@ -765,19 +851,37 @@ def monitor_and_click():
                             )
                         except Exception as e:
                             log(f"⚠️ pending error: {e}")
+                            if page.is_closed():
+                                raise KeyboardInterrupt
                         with pending_lock:
-                            pending.remove(it)
+                            try:
+                                pending.remove(it)
+                            except ValueError:
+                                pass
+                        remember_seen(it["ball_key"])
                     elif now - it["t"] > PENDING_TIMEOUT_SEC:
                         log(f"⌛ [SKIP] ball={it['ball_key']} — ১ম map nei")
-                        with first_lock:
-                            fm = first_maps.pop(it["ball_key"], None)
-                        if fm:
-                            safe_remove(fm.get("png"))
-                            for c in fm.get("cells", []):
-                                safe_remove(c.get("crop1_png"))
+                        _drop_first_map(it["ball_key"])
                         with pending_lock:
-                            pending.remove(it)
+                            try:
+                                pending.remove(it)
+                            except ValueError:
+                                pass
 
+                # ===== 2) periodic reaper =====
+                if now - last_reap >= REAP_INTERVAL:
+                    stale_keys = []
+                    with first_lock:
+                        for k, v in list(first_maps.items()):
+                            if now - v.get("ts", now) > STALE_MAP_TTL:
+                                stale_keys.append(k)
+                    for k in stale_keys:
+                        _drop_first_map(k)
+                    if stale_keys:
+                        log(f"🧹 [REAP] {len(stale_keys)} stale first_map cleaned")
+                    last_reap = now
+
+                # ===== 3) WebSocket event =====
                 try:
                     recv_ts, raw = event_q.get(timeout=0.5)
                 except queue.Empty:
@@ -786,9 +890,11 @@ def monitor_and_click():
                             np = len(pending)
                         with last_over_lock:
                             lv = last_over["v"]
-                        log(f"⏳ [HEARTBEAT] WS={'ON' if ws_state['up'] else 'OFF'} | "
+                        log(
+                            f"⏳ [HEARTBEAT] WS={'ON' if ws_state['up'] else 'OFF'} | "
                             f"targets={len(targets)} | first={len(first_maps)} | "
-                            f"pending={np} | other={other_match} | last_over={lv}")
+                            f"pending={np} | other={other_match} | last_over={lv}"
+                        )
                         last_event = time.time()
                     continue
 
@@ -811,40 +917,50 @@ def monitor_and_click():
                     other_match += 1
                     continue
 
+                # ---------- FIRST PUSH ----------
                 if push["kind"] == "first":
                     bkey = push["ball_key"]
                     if not bkey:
                         continue
+                    # duplicate: এই ball এর ২য় পুশ আগেই প্রসেস হয়ে গেছে?
+                    if was_seen(bkey):
+                        log(f"⏭️  [PUSH-1 SKIP] ball={bkey} (২য় পুশ আগেই এসেছে)")
+                        continue
+                    # পুরনো orphan থাকলে মুছে দাও
+                    with first_lock:
+                        old = first_maps.get(bkey)
+                    if old:
+                        _drop_first_map(bkey)
                     log(f"▶️  [PUSH-1] ball={bkey}")
                     try:
                         process_first_push(page, bkey)
                     except Exception as e:
                         log(f"⚠️ [PUSH-1] error: {e}")
+                        if page.is_closed():
+                            raise KeyboardInterrupt
                     continue
 
+                # ---------- DELETE ----------
                 if push["kind"] == "delete":
                     bkey = push["ball_key"]
-                    with first_lock:
-                        fm = first_maps.pop(bkey, None)
-                    if fm:
-                        safe_remove(fm["png"])
-                        for c in fm.get("cells", []):
-                            safe_remove(c.get("crop1_png"))
-                    with used_lock:
-                        used_points.pop(bkey, None)
-                    seen_second.discard(bkey)
+                    _drop_first_map(bkey)
+                    forget_seen(bkey)
+                    with pending_lock:
+                        pending[:] = [x for x in pending if x["ball_key"] != bkey]
                     log(f"🗑️  [DELETE] ball={bkey}")
                     continue
 
+                # ---------- SECOND PUSH ----------
                 if push["kind"] == "second":
                     bkey = push["ball_key"]
                     d = push["detail"]
-                    if bkey in seen_second:
+                    if was_seen(bkey):
                         continue
-                    seen_second.add(bkey)
+                    remember_seen(bkey)
 
                     over = compute_target(d)
                     if not over:
+                        log(f"⚠️ [SKIP] ball={bkey} — overs missing (detail.overs খালি)")
                         continue
                     text, kind, run = ball_info(d)
                     log(f"🏏 [PUSH-2] ball={bkey} over={over} {text} run={run}")
@@ -864,6 +980,7 @@ def monitor_and_click():
                                 "t": recv_ts, "ball_key": bkey,
                                 "over": over, "run": run,
                             })
+                        log(f"⏸️  [PENDING] queued ball={bkey}")
 
                     # ---- ওভার বদলালে ফাইল পরিষ্কার ----
                     check_over_change(over)
