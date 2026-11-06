@@ -39,11 +39,9 @@ WIN_H = VIEW_H + 120
 event_q = queue.Queue()
 ws_state = {"up": False}
 
-# targets: list of {"rect":{x,y,w,h}, "over":.., "delivery":.., "side":"over/under", "line":..}
 targets = []
 targets_lock = threading.Lock()
 
-# 1st maps: {ball_key: {"cells": [...], "png": str}}
 first_maps = {}
 first_lock = threading.Lock()
 
@@ -162,7 +160,6 @@ def ocr_text_from_png(png_path, psm=7):
 
 
 def parse_cell(text):
-    """'{over} - Over, {delivery} - Delivery, {side} {line}' থেকে সব বের করে।"""
     m = CELL_PATTERN.search(text or "")
     if not m:
         return None
@@ -181,7 +178,6 @@ def parse_cell(text):
 
 
 def parse_side_line(text):
-    """শুধু side ও line (Over/Under X.X)।"""
     m = SIDE_LINE_PATTERN.search(text or "")
     if not m:
         return (None, None)
@@ -223,7 +219,6 @@ def ssim_score(png_a, png_b):
 
 
 def ocr_worker():
-    """শুধু pytesseract — শেখানোর সময় side/line পড়তে।"""
     while not stop_evt.is_set():
         try:
             item = ocr_job_q.get(timeout=0.5)
@@ -276,7 +271,7 @@ def safe_remove(path):
         pass
 
 
-# ---------- টার্গেট শেখানো (মাউস ক্লিক + অটো OCR) ----------
+# ---------- টার্গেট শেখানো ----------
 CLICK_HOOK_JS = """
 () => {
   if (window.__targetHook) return;
@@ -347,7 +342,6 @@ def learn_targets(page):
         doc_y = click["y"] + click["scrollY"]
         rect = {"x": doc_x - rw / 2, "y": doc_y - rh / 2, "w": rw, "h": rh}
 
-        # rect-এর স্ক্রিনশট নিয়ে OCR — side/line বের করি
         over = delivery = None
         side = line = None
         try:
@@ -379,7 +373,6 @@ def learn_targets(page):
         except Exception as e:
             print(f"⚠️ OCR error: {e}")
 
-        # OCR fail হলে ম্যানুয়াল
         if not side or line is None:
             ans = input("   ম্যানুয়ালি লিখুন: side line (যেমন: over 0.5) | skip: ").strip()
             if ans.lower() == "skip":
@@ -412,21 +405,10 @@ def learn_targets(page):
             break
 
 
-# ---------- রান অনুযায়ী side/line বাছাই ----------
+# ---------- রান অনুযায়ী side/line ----------
 def decide_side_line(run):
-    """
-    run অনুযায়ী কোন side+line-এ ক্লিক করবে।
-    0 → under 0.5
-    1 → over 0.5
-    2 → over 1.5
-    3 → over 1.5
-    4 → over 3.5
-    5 → over 3.5
-    6 → over 3.5 (বড় থাকলে 4.5/5.5/6.5)
-    """
     if run == 0:
         return ("under", 0.5)
-    # Over: run > line, সবচেয়ে বড় such line
     known_lines = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
     best = None
     for ln in known_lines:
@@ -438,14 +420,10 @@ def decide_side_line(run):
 
 
 def pick_click_target(run, over, delivery):
-    """
-    targets থেকে সঠিক side+line-এর rect বেছে নেয়।
-    """
     side, line = decide_side_line(run)
     with targets_lock:
         tlist = [dict(t) for t in targets]
 
-    # exact match (side + line + over/delivery মিললে)
     exact = [
         t for t in tlist
         if t["side"] == side and t["line"] is not None
@@ -455,7 +433,6 @@ def pick_click_target(run, over, delivery):
     if exact:
         return exact[0]
 
-    # over/delivery না মিললেও side+line দিয়ে
     fallback = [
         t for t in tlist
         if t["side"] == side and t["line"] is not None
@@ -464,7 +441,6 @@ def pick_click_target(run, over, delivery):
     if fallback:
         return fallback[0]
 
-    # side মিলিয়ে সবচেয়ে কাছের line
     same_side = [t for t in tlist if t["side"] == side and t["line"] is not None]
     if same_side:
         same_side.sort(key=lambda t: abs(t["line"] - line))
@@ -472,7 +448,7 @@ def pick_click_target(run, over, delivery):
     return None
 
 
-# ---------- ১ম পুশ: শুধু rect ক্রপ (OCR নেই) ----------
+# ---------- ১ম পুশ ----------
 def process_first_push(page, ball_key):
     uid = uuid.uuid4().hex[:8]
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", ball_key)
@@ -511,7 +487,7 @@ def process_first_push(page, ball_key):
     log(f"   🗺️  {len(cells)} cells mapped")
 
 
-# ---------- ২য় পুশ: সঠিক target-এ ক্রপ + তুলনা + ক্লিক ----------
+# ---------- ২য় পুশ ----------
 def process_second_push(page, ball_key, run, over, delivery):
     with first_lock:
         fm = first_maps.get(ball_key)
@@ -519,7 +495,6 @@ def process_second_push(page, ball_key, run, over, delivery):
         log(f"⏳ [PUSH-2] ball={ball_key} — ১ম map nei, pending")
         return False
 
-    # targets থেকে সঠিক rect বেছে নিই
     target = pick_click_target(run, over, delivery)
     if not target:
         side, line = decide_side_line(run)
@@ -531,7 +506,6 @@ def process_second_push(page, ball_key, run, over, delivery):
     log(f"🎯 [TARGET] ball={ball_key} ({over},{delivery}) run={run} → "
         f"{side} {target['line']}")
 
-    # ১ম ম্যাপে এই rect-এর ক্রপ আছে?
     rect = target["rect"]
     match_cell = None
     for c in fm["cells"]:
@@ -637,8 +611,21 @@ def compute_target(d):
 
 # ---------- Main ----------
 def monitor_and_click():
-    match_filter = sys.argv[1].strip() if len(sys.argv) > 1 else ""
-    site_url = input("Site link din: ").strip() or "https://example.com"
+    # match_key বাধ্যতামূলক
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        print("\n❌ Roanuz match_key din!")
+        print("   ব্যবহার: python script.py <match_key>")
+        print("   উদাহরণ: python script.py 3108643-afghanistan-vs-zimbabwe\n")
+        return
+
+    match_filter = sys.argv[1].strip()
+    print("\n" + "=" * 60)
+    print(f"🔑 [SETUP] match_key = {match_filter}")
+    print("   শুধু এই ম্যাচের Ball-by-ball পুশ প্রসেস হবে।")
+    print("   অন্য ম্যাচের পুশ এড়িয়ে যাবে (heartbeat-এ other=N দেখাবে)।")
+    print("=" * 60)
+
+    site_url = input("\nSite link din: ").strip() or "https://example.com"
 
     if not setup_engines():
         return
@@ -668,7 +655,8 @@ def monitor_and_click():
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page.goto(site_url)
-        print("\n=== ম্যানুয়ালি লগইন করুন ===\n")
+        print("\n=== ম্যানুয়ালি লগইন করুন ===")
+        print("(ব্রাউজারে লগইন শেষে টার্মিনালে ফিরে আসুন)\n")
         match_url = input("Match URL: ").strip()
         if not match_url:
             browser.close()
@@ -676,7 +664,26 @@ def monitor_and_click():
         page.goto(match_url)
         log(f"✅ [SETUP] Match page: {page.url}")
 
+        # URL সতর্কতা: match_filter-এর অংশ আছে কিনা
+        key_head = match_filter.split("-")[0]
+        if key_head and key_head not in match_url:
+            log(f"⚠️ [WARN] URL e match_key ({match_filter}) er kono ongsho paoa jayni!")
+            log(f"   URL: {match_url}")
+            log(f"   ভুল ম্যাচের পেজ হতে পারে — যাচাই করুন।")
+            ans = input("   তবুও চালিয়ে যাবেন? (y/n): ").strip().lower()
+            if ans != "y":
+                browser.close()
+                return
+        else:
+            log(f"✓ [CHECK] URL e match_key er ongsho paoa gese")
+
+        # টার্গেট শেখানো
         learn_targets(page)
+
+        if not targets:
+            log("⚠️ কোনো টার্গেট শেখানো হয়নি — স্ক্রিপ্ট বন্ধ।")
+            browser.close()
+            return
 
         # queue clear
         while not event_q.empty():
@@ -690,7 +697,7 @@ def monitor_and_click():
         worker.start()
 
         start_ws_thread()
-        log("👂 [WS] wait korchi...\n")
+        log(f"👂 [WS] wait korchi... (match_key={match_filter})\n")
 
         last_event = time.time()
         other_match = 0
@@ -745,7 +752,9 @@ def monitor_and_click():
 
                 data = push["data"]
                 mkey = data.get("matchkey") or data.get("match_key") or data.get("key")
-                if match_filter and mkey and mkey != match_filter:
+
+                # ---- match_key ফিল্টার (বাধ্যতামূলক) ----
+                if mkey and mkey != match_filter:
                     other_match += 1
                     continue
 
@@ -753,7 +762,7 @@ def monitor_and_click():
                     bkey = push["ball_key"]
                     if not bkey:
                         continue
-                    log(f"▶️  [PUSH-1] ball={bkey}")
+                    log(f"▶️  [PUSH-1] ball={bkey} (match={mkey})")
                     try:
                         process_first_push(page, bkey)
                     except Exception as e:
