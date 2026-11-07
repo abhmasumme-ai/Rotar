@@ -37,8 +37,7 @@ VIEW_H = 920
 WIN_W = VIEW_W + 100
 WIN_H = VIEW_H + 120
 
-# ⭐ আপনার দেওয়া মাপ (Absolute Position)
-# (side, line, x, y, w, h)
+# আপনার দেওয়া মাপ
 TARGET_LAYOUTS = [
     ("over", 0.5, 7,   46, 435, 40),
     ("under", 0.5, 446, 46, 440, 40),
@@ -48,14 +47,43 @@ TARGET_LAYOUTS = [
     ("under", 3.5, 446, 131, 440, 40),
 ]
 
-# আপনার ছবি অনুযায়ী "17 - Over..." লেখাটি যে পজিশনে ছিল (রেফারেন্সের জন্য)
 BASE_ANCHOR_X = 6
 BASE_ANCHOR_Y = 37
 
-# স্ক্রল করার জন্য মার্কেট প্লেসের এরিয়া (বাইরের পেজ স্ক্রল রোধ করতে)
 MARKET_X = 400
 MARKET_Y = 500
 # ==========================================
+
+# ⭐ নতুন জাভাস্ক্রিপ্ট (লেআউট লক এবং স্ক্রল কন্ট্রোল)
+INIT_JS = """
+() => {
+    // ১. স্ক্রলবার লুকিয়ে ফেলা (যাতে স্ক্রিনশটের সময় পেজ শিংক না করে)
+    const style = document.createElement('style');
+    style.innerHTML = '::-webkit-scrollbar { display: none !important; } html, body { overflow: -moz-scrollbars-none; }';
+    document.head.appendChild(style);
+
+    // ২. মাউস হুইল ইন্টারসেপ্ট করা (যাতে বাইরের পেজ স্ক্রল না হয়)
+    document.addEventListener('wheel', function(e) {
+        // শুধুমাত্র মার্কেট এরিয়ার ভেতরে স্ক্রল করলে
+        if (e.clientX > 10 && e.clientX < 800 && e.clientY > 100 && e.clientY < 900) {
+            let el = document.elementFromPoint(e.clientX, e.clientY);
+            let scrollable = null;
+            // স্ক্রলেবল প্যারেন্ট খোঁজা
+            while (el && el !== document.body) {
+                if (el.scrollHeight > el.clientHeight) {
+                    scrollable = el;
+                    break;
+                }
+                el = el.parentElement;
+            }
+            if (scrollable) {
+                scrollable.scrollBy(0, e.deltaY);
+            }
+            e.preventDefault(); // বাইরের পেজ স্ক্রল হওয়া বন্ধ করা
+        }
+    }, { passive: false });
+}
+"""
 
 event_q = queue.Queue()
 ws_state = {"up": False}
@@ -159,18 +187,16 @@ def do_human_click(page, ball_key, rect):
 def process_first_push(page, ball_key, over_num, delivery_num):
     log(f"💾 [PUSH-1] ball={ball_key} (Searching Anchor for {over_num} - {delivery_num})")
     
-    # ১. পুরো স্ক্রিনের স্ক্রিনশট
-    img_bytes = page.screenshot(type="png", scale="css")
+    # ⭐ animations="disabled" দেওয়া হলো যাতে স্ক্রিনশটের সময় পেজ লোড বা এনিমেট না হয়
+    img_bytes = page.screenshot(type="png", scale="css", animations="disabled")
     np_arr = np.frombuffer(img_bytes, np.uint8)
     full_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
     img_pil = Image.open(io.BytesIO(img_bytes))
     
-    # ২. OCR দিয়ে ডাইনামিক অ্যাংকর (যেমন 17 - Over, 3 - Delivery) খোঁজা
     data = pytesseract.image_to_data(img_pil, config="--psm 11", output_type=pytesseract.Output.DICT)
     
-    anchor_x, anchor_y = BASE_ANCHOR_X, BASE_ANCHOR_Y # ফলব্যাক
+    anchor_x, anchor_y = BASE_ANCHOR_X, BASE_ANCHOR_Y
     
-    # লাইন অনুযায়ী গ্রুপ করা
     rows = {}
     for i in range(len(data['text'])):
         text = str(data['text'][i]).strip()
@@ -184,14 +210,12 @@ def process_first_push(page, ball_key, over_num, delivery_num):
         indices.sort(key=lambda i: data['left'][i])
         row_text = " ".join([str(data['text'][i]).strip() for i in indices]).lower()
         
-        # এই লাইনে কি আমাদের ডাইনামিক Over এবং Delivery আছে? (যেমন: "17 - over" এবং "3 - delivery")
         if str(over_num) in row_text and "over" in row_text and str(delivery_num) in row_text and "delivery" in row_text:
             anchor_x = min(data['left'][i] for i in indices)
             anchor_y = min(data['top'][i] for i in indices)
             log(f"   🎯 Anchor Found: X={anchor_x}, Y={anchor_y}")
             break
 
-    # ৩. আপনার দেওয়া মাপের সাথে ডাইনামিক অ্যাংকরের দূরত্ব বের করা
     dx = anchor_x - BASE_ANCHOR_X
     dy = anchor_y - BASE_ANCHOR_Y
 
@@ -203,7 +227,6 @@ def process_first_push(page, ball_key, over_num, delivery_num):
         tx = rx + dx
         ty = ry + dy
         
-        # স্ক্রিনের বাইরে গেলে স্কিপ
         if ty + rh > full_img.shape[0] or tx + rw > full_img.shape[1] or tx < 0 or ty < 0:
             continue
             
@@ -254,7 +277,8 @@ def process_second_push(page, ball_key, run, over):
     tpl_img = match_cell["img"]
     
     def try_match():
-        raw = page.screenshot(type="png", scale="css")
+        # ⭐ animations="disabled" দেওয়া হলো
+        raw = page.screenshot(type="png", scale="css", animations="disabled")
         np_arr = np.frombuffer(raw, np.uint8)
         src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
         if src_img is None: return None
@@ -273,7 +297,8 @@ def process_second_push(page, ball_key, run, over):
     # ২. না পেলে মার্কেট প্লেসের ভেতরে স্ক্রল করা (বাইরের পেজ নয়)
     if not match:
         log("   🔍 স্ক্রিনে পাইনি, মার্কেট প্লেসের ভেতরে স্ক্রল করছি...")
-        page.mouse.move(MARKET_X, MARKET_Y) # মাউস মার্কেটের মাঝখানে নিয়ে যাওয়া
+        # মাউসকে মার্কেট এরিয়ায় নিয়ে যাওয়া (JS ইন্টারসেপ্টর এটাকে ধরে ফেলবে)
+        page.mouse.move(MARKET_X, MARKET_Y) 
         
         page.mouse.wheel(0, -400) # উপরে
         page.wait_for_timeout(200)
@@ -339,14 +364,11 @@ def ball_info(d):
     return (str(r), "dot" if r == 0 else "run", r)
 
 def get_over_delivery(d):
-    """over এবং delivery ডাইনামিকভাবে বের করা"""
     if not isinstance(d, dict):
         return None, None
     ov = d.get("overs")
     if isinstance(ov, list) and len(ov) >= 2:
         try:
-            # d['overs'] সাধারণত [16, 2] এরকম আসে (মানে ১৭তম ওভার, ৩য় বল)
-            # তাই ১ বেসড করতে +1 করা হচ্ছে
             return int(ov[0]) + 1, int(ov[1]) + 1
         except (TypeError, ValueError):
             pass
@@ -396,7 +418,11 @@ def monitor_and_click():
         )
 
         page = context.new_page()
+        
+        # ⭐ নতুন যোগ করা জাভাস্ক্রিপ্ট ইনজেক্ট করা (লেআউট লক ও স্ক্রল ইন্টারসেপ্ট)
+        page.add_init_script(INIT_JS)
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
         page.goto(site_url)
         
         print("\n=== ম্যানুয়ালি লগইন করুন ===")
@@ -437,7 +463,6 @@ def monitor_and_click():
             while True:
                 now = time.time()
 
-                # 1) pending processing
                 with pending_lock:
                     items = list(pending)
                 for it in items:
@@ -465,7 +490,6 @@ def monitor_and_click():
                             except ValueError:
                                 pass
 
-                # 2) periodic reaper
                 if now - last_reap >= REAP_INTERVAL:
                     stale_keys = []
                     with first_lock:
@@ -478,7 +502,6 @@ def monitor_and_click():
                         log(f"🧹 [REAP] {len(stale_keys)} stale first_map cleaned")
                     last_reap = now
 
-                # 3) WebSocket event
                 try:
                     recv_ts, raw = event_q.get(timeout=0.5)
                 except queue.Empty:
@@ -505,7 +528,6 @@ def monitor_and_click():
                 if mkey and mkey != match_filter:
                     continue
 
-                # FIRST PUSH
                 if push["kind"] == "first":
                     bkey = push["ball_key"]
                     if not bkey or was_seen(bkey):
@@ -514,10 +536,9 @@ def monitor_and_click():
                         if first_maps.get(bkey):
                             _drop_first_map(bkey)
                     
-                    # ⭐ ডাইনামিক ওভার এবং ডেলিভারি বের করা
                     over_num, del_num = get_over_delivery(data)
                     if over_num is None:
-                        over_num, del_num = 17, 3 # ফলব্যাক
+                        over_num, del_num = 17, 3 
 
                     log(f"▶️  [PUSH-1] ball={bkey} (Over: {over_num}, Del: {del_num})")
                     try:
@@ -528,7 +549,6 @@ def monitor_and_click():
                             raise KeyboardInterrupt
                     continue
 
-                # DELETE
                 if push["kind"] == "delete":
                     bkey = push["ball_key"]
                     _drop_first_map(bkey)
@@ -538,7 +558,6 @@ def monitor_and_click():
                     log(f"🗑️  [DELETE] ball={bkey}")
                     continue
 
-                # SECOND PUSH
                 if push["kind"] == "second":
                     bkey = push["ball_key"]
                     d = push["detail"]
