@@ -29,15 +29,13 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (r"C:\Program Files\Tesseract
 
 COMPARE_THRESHOLD = 0.70 
 VIEW_W = 1080
-VIEW_H = 797  # ⭐ আপনার নতুন ভিউপোর্ট সাইজ
+VIEW_H = 797  
 WIN_W = VIEW_W + 100
 WIN_H = VIEW_H + 120
 
-# ⭐ DONE দেওয়ার পর স্ক্রিপ্ট এখানে ডেটা সেভ করবে
 ANCHOR_TEMPLATE = {}
 MAPPED_TARGETS = [] 
 
-# ⭐ আপনার নতুন মাপ অনুযায়ী নিখুঁত UI
 SHOW_TARGETS_JS = """
 () => {
     let box = document.getElementById('__pw_target_guide');
@@ -51,17 +49,15 @@ SHOW_TARGETS_JS = """
     
     let rowCount = window.__row_count || 3;
     
-    // ⭐ নতুন কনফিগারেশন
     let baseY = 400; 
     let anchorW = 100;
     let anchorH = 34;
     let leftX = 70;
-    let rightX = 425; // (70 + 220 + 135 gap)
+    let rightX = 425; 
     let boxW = 220;
     let boxH = 30;
     let rowGap = 3.34;
     
-    // ১. ব্লু বক্স (Anchor/Headline) - Over 0.5 এর ঠিক উপরে
     const blueBox = document.createElement('div');
     blueBox.style.cssText = `position:absolute;left:${leftX}px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;` +
       `border:2px solid #00aaff;background:rgba(0,170,255,0.4);box-sizing:border-box;` +
@@ -69,19 +65,16 @@ SHOW_TARGETS_JS = """
     blueBox.textContent = "Anchor";
     box.appendChild(blueBox);
 
-    // ২. রেড বক্স (Targets)
-    let firstRowY = baseY + anchorH; // নীল বক্সের ঠিক নিচে (434)
+    let firstRowY = baseY + anchorH;
     let finalTargets = [];
 
     for (let i = 0; i < rowCount; i++) {
         let y = firstRowY + i * (boxH + rowGap);
 
-        // Left (Over)
         const leftBox = document.createElement('div');
         leftBox.style.cssText = `position:absolute;left:${leftX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
         box.appendChild(leftBox);
 
-        // Right (Under)
         const rightBox = document.createElement('div');
         rightBox.style.cssText = `position:absolute;left:${rightX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
         box.appendChild(rightBox);
@@ -90,7 +83,6 @@ SHOW_TARGETS_JS = """
         finalTargets.push({side: 'under', x: rightX, y: y, w: boxW, h: boxH});
     }
 
-    // ৩. বাটন সেকশন
     let btnTop = firstRowY + rowCount * (boxH + rowGap) + 15;
     const btnContainer = document.createElement('div');
     btnContainer.style.cssText = `position:absolute;left:${leftX}px;top:${btnTop}px;pointer-events:auto;display:flex;gap:10px;`;
@@ -145,37 +137,29 @@ ws_state = {"up": False}
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ================= DONE ক্লিকের পর সেটআপ =================
 def setup_from_done(page, final_targets):
     log("⚙️  স্ক্রিন থেকে নীল বক্স (Anchor) এবং লাল বক্সের লেখা সেভ করা হচ্ছে...")
     
-    # UI মুছে ফেলা
     page.evaluate("() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
     page.wait_for_timeout(300)
 
-    # স্ক্রিনশট নেওয়া (UI ছাড়া)
     raw = page.screenshot(type="png", scale="css")
     np_arr = np.frombuffer(raw, np.uint8)
     src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
 
-    # ১. নীল বক্স (Anchor) সেভ করা (UI-তে Blue box ছিল y=400, x=70, w=100, h=34)
     anchor_img = src_img[400:434, 70:170]
     ANCHOR_TEMPLATE.update({"img": anchor_img, "w": 100, "h": 34})
     log("   ✅ Anchor (Blue Box) সফলভাবে সেভ হয়েছে।")
 
-    # ২. লাল বক্সগুলোর লেখা পড়া
     MAPPED_TARGETS.clear()
     for t in final_targets:
         x, y, w, h = int(t['x']), int(t['y']), int(t['w']), int(t['h'])
         
-        # ওই নির্দিষ্ট লাল বক্সের জায়গার ছবি কাটা
         crop = src_img[y:y+h, x:x+w]
         crop_resized = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
         
-        # OCR চালানো
         text = pytesseract.image_to_string(crop_resized, config='--psm 7').lower()
         
-        # লেখা থেকে লাইনটি আলাদা করা
         matches = re.findall(r'(over|under)\s*(\d+\.?\d*)', text)
         if matches:
             side, line_str = matches[-1]
@@ -189,14 +173,12 @@ def setup_from_done(page, final_targets):
         else:
             log(f"      ⚠️ OCR পড়তে পারেনি। লেখা ছিল: '{text.strip()[:30]}'")
 
-# ================= লাইভ ভেরিফিকেশন =================
 def verify_over_delivery(img_crop, ws_over, market_del):
     try:
         img_crop = cv2.resize(img_crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
         text = pytesseract.image_to_string(img_crop, config='--psm 7').lower()
         clean_text = re.sub(r'[^a-z0-9]', '', text)
         
-        # ওভার এবং ডেলিভারি নাম্বার ম্যাচিং
         if str(ws_over) in clean_text and str(market_del) in clean_text:
             return True
         return False
@@ -221,7 +203,6 @@ def process_second_push(page, ball_key, run, kind, ws_over, market_del):
 
     log(f"🎯 [TARGET] ball={ball_key} run={run} ({kind}) → {side_want} {line_want} | WS: {ws_over}-{market_del}")
 
-    # ১. নীল বক্স (Anchor) খুঁজে আনা
     page.evaluate(SCROLL_JS, -2000)
     page.wait_for_timeout(300)
     
@@ -248,7 +229,6 @@ def process_second_push(page, ball_key, run, kind, ws_over, market_del):
         log(f"❌ [NO-CLICK] ball={ball_key} — নীল বক্স (Anchor) পাওয়া যায়নি!")
         return False
 
-    # ২. সঠিক লাল বক্সটি খোঁজা
     target_box = None
     for t in MAPPED_TARGETS:
         if t["side"] == side_want and abs(t["line"] - line_want) < 0.01:
@@ -259,13 +239,10 @@ def process_second_push(page, ball_key, run, kind, ws_over, market_del):
         log(f"❌ [NO-CLICK] ball={ball_key} — ম্যাপিং-এ {side_want} {line_want} নেই!")
         return False
 
-    # বক্সের বর্তমান পজিশন বের করা (Anchor এর সাপেক্ষে)
-    # baseY ছিল 400, firstRowY ছিল 434
-    rel_y = target_box["y"] - 434
+    rel_y = target_box["y"] - 434 
     actual_y = ay + rel_y
-    actual_x = ax + (target_box["x"] - 70) # 70 হলো UI তে নীল বক্সের x
+    actual_x = ax + (target_box["x"] - 70) 
 
-    # ৩. ভেরিফিকেশন (লেখা মিলছে কিনা)
     crop = src_img[actual_y:actual_y+target_box["h"], actual_x:actual_x+target_box["w"]]
     
     if verify_over_delivery(crop, ws_over, market_del):
@@ -287,7 +264,6 @@ def process_second_push(page, ball_key, run, kind, ws_over, market_del):
         log(f"   ⚠️ [OCR Mismatch] বাটন পাওয়া গেছে কিন্তু নাম্বার মেলেনি।")
         return False
 
-# ================= WebSocket & Parsers =================
 async def ws_loop():
     while True:
         try:
@@ -359,7 +335,6 @@ def make_seen_lru(maxlen):
         while len(od) > maxlen: od.popitem(last=False)
     return remember, lambda k: k in od, lambda k: od.pop(k, None)
 
-# ================= Main =================
 def monitor_and_click():
     if len(sys.argv) < 2: return
     match_filter = sys.argv[1].strip()
@@ -369,9 +344,41 @@ def monitor_and_click():
 
     site_url = input("\nSite link din: ").strip() or "https://example.com"
 
+    # ⭐ প্রোক্সি সেটিংস
+    proxy_config = None
+    print("\n=== Proxy Settings (IPRoyal) ===")
+    proxy_url = input("Proxy URL (e.g., http://user:pass@geo.iproyal.com:12321) [Leave blank to skip]: ").strip()
+
+    if proxy_url:
+        try:
+            if "@" in proxy_url:
+                proto, rest = proxy_url.split("://") if "://" in proxy_url else ("http://", proxy_url)
+                auth, host_port = rest.split("@")
+                user, pwd = auth.split(":")
+                proxy_config = {
+                    "server": f"{proto}://{host_port}",
+                    "username": user,
+                    "password": pwd
+                }
+            else:
+                proxy_config = {"server": proxy_url}
+            log(f"✅ Proxy configured: {proxy_config['server']}")
+        except Exception as e:
+            log(f"❌ Proxy format error: {e}. Skipping proxy.")
+            proxy_config = None
+    else:
+        log("⏭️ Proxy skipped. Running on local IP.")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=[f"--window-size={WIN_W},{WIN_H}", "--window-position=0,0"])
-        context = browser.new_context(viewport={"width": VIEW_W, "height": VIEW_H}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36")
+        
+        # ⭐ প্রোক্সি ইনজেক্ট করা হলো context-এ
+        context = browser.new_context(
+            viewport={"width": VIEW_W, "height": VIEW_H}, 
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            proxy=proxy_config # <--- Proxy ekhane inject hocche
+        )
+        
         page = context.new_page()
         page.goto(site_url)
         
