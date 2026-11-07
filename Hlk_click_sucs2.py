@@ -7,7 +7,6 @@ import re
 import sys
 import threading
 import time
-import uuid
 import io
 from collections import OrderedDict
 from pathlib import Path
@@ -26,32 +25,28 @@ PING_SEC = 30
 HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 CHROME_PATH = os.environ.get("CLICKER_CHROME_PATH") or None
 
-PENDING_TIMEOUT_SEC = 10.0     
-STALE_MAP_TTL = 30.0           
-REAP_INTERVAL = 5.0            
-SEEN_SECOND_MAX = 300          
-COMPARE_THRESHOLD = 0.75  # ছবি ম্যাচিংয়ের জন্য থ্রেশহোল্ড
-
+COMPARE_THRESHOLD = 0.75
 VIEW_W = 1080
 VIEW_H = 920
 WIN_W = VIEW_W + 100
 WIN_H = VIEW_H + 120
 
-# ================= INBUILD TARGET MAPPING (আপনার দেওয়া মাপ) =================
+# ================= INBUILD TARGET MAPPING =================
 # (side, line, X, Y, Width, Height)
+# Y=350,390,430 (মাঝখানে), Width=220 (শুধু লেখা), X=480 (ডানদিকের ওডস এড়াতে)
 TARGET_LAYOUTS = [
-    ("over", 0.5, 7,   46, 435, 40),
-    ("under", 0.5, 446, 46, 440, 40),
-    ("over", 1.5, 7,   89, 435, 40),
-    ("under", 1.5, 446, 89, 440, 40),
-    ("over", 3.5, 7,   131, 435, 40),
-    ("under", 3.5, 446, 131, 440, 40),
+    ("over", 0.5, 10,  350, 220, 30),
+    ("under", 0.5, 480, 350, 220, 30),
+    ("over", 1.5, 10,  390, 220, 30),
+    ("under", 1.5, 480, 390, 220, 30),
+    ("over", 3.5, 10,  430, 220, 30),
+    ("under", 3.5, 480, 430, 220, 30),
 ]
-# ========================================================================
+# ==========================================================
 
-TEMPLATES = {} # মেমোরিতে বাটনগুলোর ছবি জমা রাখার ডিকশনারি
+TEMPLATES = {} 
 
-# ⭐ স্ক্রিনে লাল বক্স (Visual Guide) দেখানোর জন্য
+# ⭐ UI Overlay (Red Box + DONE/RESET Buttons)
 SHOW_TARGETS_JS = """
 (targets) => {
     let box = document.getElementById('__pw_target_guide');
@@ -62,19 +57,43 @@ SHOW_TARGETS_JS = """
         document.body.appendChild(box);
     }
     box.innerHTML = '';
+    
+    // Red Boxes
     targets.forEach((t) => {
         const d = document.createElement('div');
         d.style.cssText = `position:absolute;left:${t.x}px;top:${t.y}px;` +
-          `width:${t.w}px;height:${t.h}px;border:3px solid red;` +
-          `background:rgba(255,0,0,0.2);box-sizing:border-box;font:bold 16px sans-serif;color:white;` +
+          `width:${t.w}px;height:${t.h}px;border:2px solid red;` +
+          `background:rgba(255,0,0,0.2);box-sizing:border-box;font:bold 14px sans-serif;color:white;` +
           `display:flex;align-items:center;justify-content:center;text-shadow: 1px 1px 2px black;`;
         d.textContent = `${t.side.toUpperCase()} ${t.line}`;
         box.appendChild(d);
     });
+
+    // DONE and RESET Buttons
+    const btnContainer = document.createElement('div');
+    btnContainer.style.cssText = 'position:absolute;left:10px;top:480px;pointer-events:auto;display:flex;gap:20px;';
+    
+    const doneBtn = document.createElement('button');
+    doneBtn.textContent = 'DONE';
+    doneBtn.style.cssText = 'padding:15px 40px;font-size:20px;font-weight:bold;background:#00c853;color:white;border:none;border-radius:8px;cursor:pointer;box-shadow: 0 4px 6px rgba(0,0,0,0.3);';
+    doneBtn.onclick = () => {
+        box.style.display = 'none'; // Hide overlay before capturing
+        window.__pw_action = 'done';
+    };
+
+    const resetBtn = document.createElement('button');
+    resetBtn.textContent = 'RESET';
+    resetBtn.style.cssText = 'padding:15px 40px;font-size:20px;font-weight:bold;background:#ff3d00;color:white;border:none;border-radius:8px;cursor:pointer;box-shadow: 0 4px 6px rgba(0,0,0,0.3);';
+    resetBtn.onclick = () => {
+        window.__pw_action = 'reset';
+    };
+
+    btnContainer.appendChild(doneBtn);
+    btnContainer.appendChild(resetBtn);
+    box.appendChild(btnContainer);
 }
 """
 
-# ⭐ মার্কেট প্লেসের ভেতরে স্ক্রল করার জন্য (বাইরের পেজ নয়)
 SCROLL_JS = """
 (dy) => {
     let x = 400, y = 500;
@@ -94,38 +113,23 @@ SCROLL_JS = """
 event_q = queue.Queue()
 ws_state = {"up": False}
 
-used_points = {}
-used_lock = threading.Lock()
-
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def safe_remove(path):
-    try:
-        if path and os.path.exists(path): os.remove(path)
-    except Exception: pass
-
-# ================= ১. স্বয়ংক্রিয়ভাবে ছবি কেটে নেওয়া =================
+# ================= ছবি ক্যাপচার =================
 def auto_capture_templates(page):
-    log("📸 আপনার দেওয়া ফর্ম (Layout) অনুযায়ী বাটনগুলোর ছবি কেটে নেওয়া হচ্ছে...")
-    
-    # স্ক্রিনশট নেওয়া
+    log("📸 আপনার দেওয়া ফর্ম অনুযায়ী বাটনগুলোর ছবি কেটে নেওয়া হচ্ছে...")
     img_bytes = page.screenshot(type="png", scale="css")
     np_arr = np.frombuffer(img_bytes, np.uint8)
     full_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
     
     TEMPLATES.clear()
-    
     for side, line, rx, ry, rw, rh in TARGET_LAYOUTS:
-        # স্ক্রিনের বাইরে গেলে স্কিপ
         if ry + rh > full_img.shape[0] or rx + rw > full_img.shape[1] or rx < 0 or ry < 0:
             continue
-            
         crop_img = full_img[ry:ry+rh, rx:rx+rw]
         TEMPLATES[(side, line)] = {"img": crop_img, "w": rw, "h": rh}
-        log(f"   ✅ ক্যাপচারড: {side.upper()} {line} (Size: {rw}x{rh})")
-
-    log(f"✅ মোট {len(TEMPLATES)}টি টার্গেট মেমোরিতে সেভ হয়েছে।")
+        log(f"   ✅ ক্যাপচারড: {side.upper()} {line}")
 
 # ================= ২. স্মার্ট স্ক্রল এবং ক্লিক =================
 def process_second_push(page, ball_key, run, over):
@@ -136,7 +140,7 @@ def process_second_push(page, ball_key, run, over):
 
     tpl_data = TEMPLATES.get((side_want, line_want))
     if not tpl_data:
-        log(f"❌ [NO-CLICK] {side_want} {line_want} এর জন্য কোনো ছবি নেই!")
+        log(f"❌ [NO-CLICK] {side_want} {line_want} এর জন্য ছবি নেই!")
         return False
 
     tpl_img = tpl_data["img"]
@@ -154,25 +158,21 @@ def process_second_push(page, ball_key, run, over):
             return {"x": max_loc[0], "y": max_loc[1], "w": tpl_data["w"], "h": tpl_data["h"], "score": max_val}
         return None
 
-    # ১. বর্তমান স্ক্রিনে খোঁজা
     match = try_match()
     
-    # ২. না পেলে ভেতরের মার্কেট প্লেসে স্ক্রল করা
     if not match:
         log("   🔍 স্ক্রিনে পাইনি, মার্কেট প্লেসের ভেতরে স্ক্রল করছি...")
-        
-        page.evaluate(SCROLL_JS, -300) # উপরে
+        page.evaluate(SCROLL_JS, -300)
         page.wait_for_timeout(200)
         match = try_match()
         
         if not match:
-            page.evaluate(SCROLL_JS, 600) # নিচে
+            page.evaluate(SCROLL_JS, 600)
             page.wait_for_timeout(200)
             match = try_match()
 
     if match:
         log(f"   🎯 Found at ({match['x']},{match['y']}) score={match['score']:.3f}")
-        
         px = match['x'] + (match['w'] / 2)
         py = match['y'] + (match['h'] / 2)
         
@@ -185,7 +185,6 @@ def process_second_push(page, ball_key, run, over):
             log(f"✅ [CLICK] ball={ball_key} at ({px:.0f},{py:.0f})")
         except Exception as e:
             log(f"⚠️ [CLICK] error: {e}")
-            
         return True
     else:
         log(f"❌ [NO-CLICK] ball={ball_key} — স্ক্রিনে বাটনটি পাওয়া যায়নি।")
@@ -194,7 +193,6 @@ def process_second_push(page, ball_key, run, over):
 # ================= WebSocket & Parsers =================
 async def ws_loop():
     while True:
-        err = None
         try:
             async with websockets.connect(WS_URL, ping_interval=None, compression=None, max_size=None) as ws:
                 ws_state["up"] = True
@@ -211,11 +209,9 @@ async def ws_loop():
                         event_q.put((time.time(), msg))
                 finally:
                     ptask.cancel()
-        except Exception as e:
-            err = e
-        if ws_state["up"]: log("🔌 [WS] disconnected")
+        except Exception:
+            pass
         ws_state["up"] = False
-        log(f"🔄 [WS] {RECONNECT_SEC}s pore reconnect...")
         await asyncio.sleep(RECONNECT_SEC)
 
 def start_ws_thread():
@@ -282,24 +278,35 @@ def monitor_and_click():
         page.goto(match_url)
         log(f"✅ Match page: {page.url}")
 
-        # ⭐ লাল বক্স দেখানো (Visual Guide)
-        overlay_data = [{"side": side, "line": line, "x": x, "y": y, "w": w, "h": h} for side, line, x, y, w, h in TARGET_LAYOUTS]
-        page.evaluate(SHOW_TARGETS_JS, overlay_data)
-
         print("\n" + "="*65)
         print("👉 ব্রাউজারে গিয়ে ম্যানুয়ালি 'Quick Events' সিলেক্ট করুন।")
         print("👉 মাউস হুইল দিয়ে স্ক্রল করুন এবং আসল বাটনগুলোকে লাল বক্সের ভেতরে আনুন।")
-        print("👉 স্ক্রিন রেডি হলে টার্মিনালে 'done' লিখে Enter দিন।")
+        print("👉 সব ঠিক থাকলে স্ক্রিনের নিচে থাকা সবুজ 'DONE' বাটনে ক্লিক করুন।")
         print("="*65 + "\n")
+
+        overlay_data = [{"side": side, "line": line, "x": x, "y": y, "w": w, "h": h} for side, line, x, y, w, h in TARGET_LAYOUTS]
         
+        # ⭐ UI লুপ (DONE এবং RESET হ্যান্ডেল করার জন্য)
         while True:
-            ans = input("টার্মিনালে 'done' লিখুন: ").strip().lower()
-            if ans == "done": break
+            page.evaluate(SHOW_TARGETS_JS, overlay_data)
+            page.evaluate("() => { window.__pw_action = null; }") # Reset flag
+            
+            print("⏳ ব্রাউজারে সবুজ 'DONE' বাটনে ক্লিক করুন...")
+            while True:
+                action = page.evaluate("() => window.__pw_action")
+                if action == 'done':
+                    break
+                elif action == 'reset':
+                    break # Break inner loop to redraw
+                page.wait_for_timeout(200)
 
-        # লাল বক্স মুছে ফেলা
+            if action == 'done':
+                break # Exit outer loop and proceed
+
+        # লাল বক্স ও বাটন মুছে ফেলা
         page.evaluate("() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
+        page.wait_for_timeout(300) # UI settle হওয়ার জন্য অপেক্ষা
 
-        # ⭐ কোড নিজেই ছবি কেটে নেবে
         auto_capture_templates(page)
 
         if not TEMPLATES:
@@ -307,10 +314,32 @@ def monitor_and_click():
             browser.close()
             return
 
+        # ⭐ Terminal Reset অপশন
+        while True:
+            cmd = input("\nলাইভ স্ক্রিপ্ট শুরু করতে 'start' লিখুন, আবার বক্স এডজাস্ট করতে 'reset' লিখুন: ").strip().lower()
+            if cmd == 'start':
+                break
+            elif cmd == 'reset':
+                log("🔄 রিসেট করা হচ্ছে... আবার DONE ক্লিক করুন।")
+                overlay_data = [{"side": side, "line": line, "x": x, "y": y, "w": w, "h": h} for side, line, x, y, w, h in TARGET_LAYOUTS]
+                while True:
+                    page.evaluate(SHOW_TARGETS_JS, overlay_data)
+                    page.evaluate("() => { window.__pw_action = null; }")
+                    print("⏳ ব্রাউজারে সবুজ 'DONE' বাটনে ক্লিক করুন...")
+                    while True:
+                        action = page.evaluate("() => window.__pw_action")
+                        if action == 'done': break
+                        elif action == 'reset': break
+                        page.wait_for_timeout(200)
+                    if action == 'done': break
+                page.evaluate("() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
+                page.wait_for_timeout(300)
+                auto_capture_templates(page)
+
         start_ws_thread()
         log(f"👂 [WS] wait korchi... (match_key={match_filter})\n")
 
-        remember_seen, was_seen, forget_seen = make_seen_lru(SEEN_SECOND_MAX)
+        remember_seen, was_seen, forget_seen = make_seen_lru(300)
 
         try:
             while True:
