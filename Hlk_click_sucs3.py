@@ -29,7 +29,7 @@ TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (r"C:\Program Files\Tesseract
 
 COMPARE_THRESHOLD = 0.70 
 VIEW_W = 1080
-VIEW_H = 920
+VIEW_H = 797  # ⭐ আপনার নতুন ভিউপোর্ট সাইজ
 WIN_W = VIEW_W + 100
 WIN_H = VIEW_H + 120
 
@@ -37,7 +37,7 @@ WIN_H = VIEW_H + 120
 ANCHOR_TEMPLATE = {}
 MAPPED_TARGETS = [] 
 
-# ⭐ পরিষ্কার UI (Blue Anchor + Red Boxes)
+# ⭐ আপনার নতুন মাপ অনুযায়ী নিখুঁত UI
 SHOW_TARGETS_JS = """
 () => {
     let box = document.getElementById('__pw_target_guide');
@@ -50,45 +50,50 @@ SHOW_TARGETS_JS = """
     box.innerHTML = '';
     
     let rowCount = window.__row_count || 3;
-    let baseY = 450; 
-    let anchorW = 420;
-    let anchorH = 25;
     
-    // ১. ব্লু বক্স (Anchor/Headline)
+    // ⭐ নতুন কনফিগারেশন
+    let baseY = 400; 
+    let anchorW = 100;
+    let anchorH = 34;
+    let leftX = 70;
+    let rightX = 425; // (70 + 220 + 135 gap)
+    let boxW = 220;
+    let boxH = 30;
+    let rowGap = 3.34;
+    
+    // ১. ব্লু বক্স (Anchor/Headline) - Over 0.5 এর ঠিক উপরে
     const blueBox = document.createElement('div');
-    blueBox.style.cssText = `position:absolute;left:70px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;` +
-      `border:2px solid #00aaff;background:rgba(0,170,255,0.3);box-sizing:border-box;` +
-      `display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:12px;`;
-    blueBox.textContent = "HEADLINE (Anchor)";
+    blueBox.style.cssText = `position:absolute;left:${leftX}px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;` +
+      `border:2px solid #00aaff;background:rgba(0,170,255,0.4);box-sizing:border-box;` +
+      `display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:10px;`;
+    blueBox.textContent = "Anchor";
     box.appendChild(blueBox);
 
     // ২. রেড বক্স (Targets)
-    let firstRowY = baseY + anchorH; 
-    let rowGap = 4;
-    let rowHeight = 30;
+    let firstRowY = baseY + anchorH; // নীল বক্সের ঠিক নিচে (434)
     let finalTargets = [];
 
     for (let i = 0; i < rowCount; i++) {
-        let y = firstRowY + i * (rowHeight + rowGap);
+        let y = firstRowY + i * (boxH + rowGap);
 
         // Left (Over)
         const leftBox = document.createElement('div');
-        leftBox.style.cssText = `position:absolute;left:70px;top:${y}px;width:${anchorW}px;height:${rowHeight}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
+        leftBox.style.cssText = `position:absolute;left:${leftX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
         box.appendChild(leftBox);
 
         // Right (Under)
         const rightBox = document.createElement('div');
-        rightBox.style.cssText = `position:absolute;left:510px;top:${y}px;width:${anchorW}px;height:${rowHeight}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
+        rightBox.style.cssText = `position:absolute;left:${rightX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
         box.appendChild(rightBox);
 
-        finalTargets.push({side: 'over', x: 70, y: y, w: anchorW, h: rowHeight});
-        finalTargets.push({side: 'under', x: 510, y: y, w: anchorW, h: rowHeight});
+        finalTargets.push({side: 'over', x: leftX, y: y, w: boxW, h: boxH});
+        finalTargets.push({side: 'under', x: rightX, y: y, w: boxW, h: boxH});
     }
 
     // ৩. বাটন সেকশন
-    let btnTop = firstRowY + rowCount * (rowHeight + rowGap) + 10;
+    let btnTop = firstRowY + rowCount * (boxH + rowGap) + 15;
     const btnContainer = document.createElement('div');
-    btnContainer.style.cssText = `position:absolute;left:70px;top:${btnTop}px;pointer-events:auto;display:flex;gap:10px;`;
+    btnContainer.style.cssText = `position:absolute;left:${leftX}px;top:${btnTop}px;pointer-events:auto;display:flex;gap:10px;`;
     
     const doneBtn = document.createElement('button');
     doneBtn.textContent = 'DONE';
@@ -153,15 +158,15 @@ def setup_from_done(page, final_targets):
     np_arr = np.frombuffer(raw, np.uint8)
     src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
 
-    # ১. নীল বক্স (Anchor) সেভ করা (UI-তে Blue box ছিল y=450, x=70, w=420, h=25)
-    anchor_img = src_img[450:475, 70:490]
-    ANCHOR_TEMPLATE.update({"img": anchor_img, "w": 420, "h": 25})
+    # ১. নীল বক্স (Anchor) সেভ করা (UI-তে Blue box ছিল y=400, x=70, w=100, h=34)
+    anchor_img = src_img[400:434, 70:170]
+    ANCHOR_TEMPLATE.update({"img": anchor_img, "w": 100, "h": 34})
     log("   ✅ Anchor (Blue Box) সফলভাবে সেভ হয়েছে।")
 
     # ২. লাল বক্সগুলোর লেখা পড়া
     MAPPED_TARGETS.clear()
     for t in final_targets:
-        x, y, w, h = t['x'], t['y'], t['w'], t['h']
+        x, y, w, h = int(t['x']), int(t['y']), int(t['w']), int(t['h'])
         
         # ওই নির্দিষ্ট লাল বক্সের জায়গার ছবি কাটা
         crop = src_img[y:y+h, x:x+w]
@@ -170,11 +175,9 @@ def setup_from_done(page, final_targets):
         # OCR চালানো
         text = pytesseract.image_to_string(crop_resized, config='--psm 7').lower()
         
-        # লেখা থেকে লাইনটি আলাদা করা (যেমন: over 0.5 বা under 1.5)
-        # যেহেতু লেখায় "24 - Over, 0 - Delivery, Over 0.5" থাকে, তাই রেজেক্স দিয়ে শেষেরটা নিচ্ছি
+        # লেখা থেকে লাইনটি আলাদা করা
         matches = re.findall(r'(over|under)\s*(\d+\.?\d*)', text)
         if matches:
-            # সাধারণত শেষের ম্যাচটাই আসল লাইন হয় (Over 0.5)
             side, line_str = matches[-1]
             line = float(line_str)
             MAPPED_TARGETS.append({
@@ -257,7 +260,8 @@ def process_second_push(page, ball_key, run, kind, ws_over, market_del):
         return False
 
     # বক্সের বর্তমান পজিশন বের করা (Anchor এর সাপেক্ষে)
-    rel_y = target_box["y"] - 475 # 475 হলো UI তে প্রথম লাল বক্সের y
+    # baseY ছিল 400, firstRowY ছিল 434
+    rel_y = target_box["y"] - 434
     actual_y = ay + rel_y
     actual_x = ax + (target_box["x"] - 70) # 70 হলো UI তে নীল বক্সের x
 
@@ -396,8 +400,6 @@ def monitor_and_click():
 
             if action == 'done':
                 final_targets = page.evaluate("() => window.__pw_final_targets")
-                
-                # ⭐ DONE দেওয়ার সাথে সাথে অটো-রিডিং হবে
                 setup_from_done(page, final_targets)
                 break
             elif action == 'reset':
