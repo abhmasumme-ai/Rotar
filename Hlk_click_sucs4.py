@@ -41,6 +41,9 @@ market_del_counter = 0
 CALIBRATED_ANCHOR_POS = None 
 last_anchor_pos = None 
 
+# ⭐ স্ক্রিপ্ট সবসময় শুধুমাত্র প্রথম ৩টি রো (Row) টার্গেট হিসেবে ধরবে
+TARGET_ROWS = 3 
+
 SHOW_TARGETS_JS = """
 () => {
     let box = document.getElementById('__pw_target_guide');
@@ -151,7 +154,6 @@ def setup_from_done(page, final_targets):
     anchor_img = src_img[400:434, 70:170]
     ANCHOR_TEMPLATE.update({"img": anchor_img, "w": 100, "h": 34})
     
-    # ⭐ DONE দেওয়ার সময় অ্যাংকরের পজিশন সেভ করা হলো (Fast-Path)
     res = cv2.matchTemplate(src_img, anchor_img, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
     if max_val >= COMPARE_THRESHOLD:
@@ -163,7 +165,9 @@ def setup_from_done(page, final_targets):
     MAPPED_TARGETS.clear()
     max_del = 0
     
-    for t in final_targets:
+    # ⭐ এখানে পরিবর্তন করা হয়েছে: শুধুমাত্র প্রথম ৩টি রো (৬টি বক্স) ম্যাপ হবে
+    max_boxes = TARGET_ROWS * 2 
+    for t in final_targets[:max_boxes]:
         x, y, w, h = int(t['x']), int(t['y']), int(t['w']), int(t['h'])
         
         crop = src_img[y:y+h, x:x+w]
@@ -186,6 +190,7 @@ def setup_from_done(page, final_targets):
 
     market_del_counter = max_del
     log(f"   📊 স্ক্রিন থেকে বর্তমান ডেলিভারি সেট করা হলো: {market_del_counter}")
+    log(f"   🎯 শুধুমাত্র প্রথম {TARGET_ROWS}টি রো টার্গেট হিসেবে ম্যাপ করা হয়েছে।")
 
 def decide_side_line(run, kind):
     if kind == 'wide':
@@ -214,7 +219,6 @@ def ocr_crop(src_img, x, y, w, h):
     config = '--psm 7 -c tessedit_char_whitelist=0123456789.ovrdeli'
     return pytesseract.image_to_string(crop_resized, config=config).lower()
 
-# ⭐ নতুন সুপার ফাস্ট find_anchor লজিক
 def find_anchor(page):
     global CALIBRATED_ANCHOR_POS, last_anchor_pos
     
@@ -222,7 +226,6 @@ def find_anchor(page):
     np_arr = np.frombuffer(raw, np.uint8)
     src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
     
-    # ১. Fast-Path: DONE দেওয়ার সময় যে জায়গায় ছিল, ঠিক সেখানে চেক করা
     if CALIBRATED_ANCHOR_POS:
         cx, cy = CALIBRATED_ANCHOR_POS
         if cx + ANCHOR_TEMPLATE["w"] < VIEW_W and cy + ANCHOR_TEMPLATE["h"] < VIEW_H:
@@ -233,7 +236,6 @@ def find_anchor(page):
                 if max_val >= 0.90: 
                     return src_img, cx, cy
 
-    # ২. Slow-Path: শেষবার যেখানে পেয়েছিলাম সেখানে চেক করা
     if last_anchor_pos:
         ax, ay = last_anchor_pos
         if ax + ANCHOR_TEMPLATE["w"] < VIEW_W and ay + ANCHOR_TEMPLATE["h"] < VIEW_H:
@@ -242,10 +244,9 @@ def find_anchor(page):
                 res = cv2.matchTemplate(crop, ANCHOR_TEMPLATE["img"], cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(res)
                 if max_val >= 0.90:
-                    CALIBRATED_ANCHOR_POS = (ax, ay) # নতুন পজিশন আপডেট
+                    CALIBRATED_ANCHOR_POS = (ax, ay)
                     return src_img, ax, ay
 
-    # ৩. পুরো স্ক্রিনে খোঁজা
     res = cv2.matchTemplate(src_img, ANCHOR_TEMPLATE["img"], cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
     if max_val >= COMPARE_THRESHOLD:
@@ -253,7 +254,6 @@ def find_anchor(page):
         CALIBRATED_ANCHOR_POS = max_loc
         return src_img, max_loc[0], max_loc[1]
 
-    # ৪. না পেলে স্ক্রল করে খোঁজা
     page.evaluate(SCROLL_JS, -2000)
     page.wait_for_timeout(200)
     for _ in range(10):
@@ -307,7 +307,7 @@ def process_second_push(page, ball_key, run, kind, ws_over, market_del):
             try:
                 page.mouse.move(center_x, center_y)
                 page.mouse.down() 
-                page.wait_for_timeout(random.randint(5, 10)) # ⭐ Human-like delay (5-10ms)
+                page.wait_for_timeout(random.randint(5, 10)) 
                 page.mouse.up()
                 log(f"✅ [CLICK] ball={ball_key}")
                 return True
@@ -519,7 +519,7 @@ def monitor_and_click():
                         last_ws_over = ws_over
                         market_del_counter = 1
                         last_anchor_pos = None 
-                        CALIBRATED_ANCHOR_POS = None # ⭐ নতুন ওভার হলে মেমোরি রিসেট
+                        CALIBRATED_ANCHOR_POS = None
                     else:
                         market_del_counter += 1
                     
