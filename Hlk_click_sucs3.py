@@ -27,109 +27,88 @@ HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 CHROME_PATH = os.environ.get("CLICKER_CHROME_PATH") or None
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None)
 
-COMPARE_THRESHOLD = 0.70
+COMPARE_THRESHOLD = 0.70 
 VIEW_W = 1080
 VIEW_H = 920
 WIN_W = VIEW_W + 100
 WIN_H = VIEW_H + 120
 
-TARGET_LAYOUTS = []
-TEMPLATES = {} 
+# ⭐ DONE দেওয়ার পর স্ক্রিপ্ট এখানে ডেটা সেভ করবে
+ANCHOR_TEMPLATE = {}
+MAPPED_TARGETS = [] 
 
+# ⭐ পরিষ্কার UI (Blue Anchor + Red Boxes)
 SHOW_TARGETS_JS = """
 () => {
     let box = document.getElementById('__pw_target_guide');
     if (!box) {
         box = document.createElement('div');
         box.id = '__pw_target_guide';
-        box.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:999999;background:rgba(0,0,0,0.4);';
+        box.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:999999;background:rgba(0,0,0,0.2);';
         document.body.appendChild(box);
     }
     box.innerHTML = '';
     
     let rowCount = window.__row_count || 3;
+    let baseY = 450; 
+    let anchorW = 420;
+    let anchorH = 25;
     
+    // ১. ব্লু বক্স (Anchor/Headline)
     const blueBox = document.createElement('div');
-    blueBox.style.cssText = `position:absolute;left:168px;top:150px;width:221px;height:32px;` +
-      `border:2px solid blue;background:rgba(0,0,255,0.3);box-sizing:border-box;` +
+    blueBox.style.cssText = `position:absolute;left:70px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;` +
+      `border:2px solid #00aaff;background:rgba(0,170,255,0.3);box-sizing:border-box;` +
       `display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:12px;`;
     blueBox.textContent = "HEADLINE (Anchor)";
     box.appendChild(blueBox);
 
-    let baseY = 192;
+    // ২. রেড বক্স (Targets)
+    let firstRowY = baseY + anchorH; 
+    let rowGap = 4;
+    let rowHeight = 30;
     let finalTargets = [];
 
     for (let i = 0; i < rowCount; i++) {
-        let y = baseY + i * 37;
+        let y = firstRowY + i * (rowHeight + rowGap);
 
+        // Left (Over)
         const leftBox = document.createElement('div');
-        leftBox.style.cssText = `position:absolute;left:168px;top:${y}px;width:304px;height:32px;border:2px solid red;background:rgba(255,0,0,0.1);box-sizing:border-box;display:flex;`;
-        
-        const yBoxL = document.createElement('div');
-        yBoxL.style.cssText = `width:152px;height:100%;background:rgba(255,255,0,0.3);display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;font-weight:bold;`;
-        yBoxL.textContent = `Over`;
-        
-        const cBoxL = document.createElement('div');
-        cBoxL.style.cssText = `width:152px;height:100%;background:rgba(0,255,255,0.3);display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;font-weight:bold;`;
-        cBoxL.textContent = `Del`;
-        
-        leftBox.appendChild(yBoxL);
-        leftBox.appendChild(cBoxL);
+        leftBox.style.cssText = `position:absolute;left:70px;top:${y}px;width:${anchorW}px;height:${rowHeight}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
         box.appendChild(leftBox);
 
+        // Right (Under)
         const rightBox = document.createElement('div');
-        rightBox.style.cssText = `position:absolute;left:482px;top:${y}px;width:304px;height:32px;border:2px solid red;background:rgba(255,0,0,0.1);box-sizing:border-box;display:flex;`;
-        
-        const yBoxR = document.createElement('div');
-        yBoxR.style.cssText = `width:152px;height:100%;background:rgba(255,255,0,0.3);display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;font-weight:bold;`;
-        yBoxR.textContent = `Over`;
-        
-        const cBoxR = document.createElement('div');
-        cBoxR.style.cssText = `width:152px;height:100%;background:rgba(0,255,255,0.3);display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;font-weight:bold;`;
-        cBoxR.textContent = `Del`;
-        
-        rightBox.appendChild(yBoxR);
-        rightBox.appendChild(cBoxR);
+        rightBox.style.cssText = `position:absolute;left:510px;top:${y}px;width:${anchorW}px;height:${rowHeight}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
         box.appendChild(rightBox);
 
-        finalTargets.push({side: 'over', x: 168, y: y, w: 304, h: 32});
-        finalTargets.push({side: 'under', x: 482, y: y, w: 304, h: 32});
+        finalTargets.push({side: 'over', x: 70, y: y, w: anchorW, h: rowHeight});
+        finalTargets.push({side: 'under', x: 510, y: y, w: anchorW, h: rowHeight});
     }
 
-    let btnTop = baseY + rowCount * 37 + 15;
+    // ৩. বাটন সেকশন
+    let btnTop = firstRowY + rowCount * (rowHeight + rowGap) + 10;
     const btnContainer = document.createElement('div');
-    btnContainer.style.cssText = `position:absolute;left:168px;top:${btnTop}px;pointer-events:auto;display:flex;gap:10px;`;
+    btnContainer.style.cssText = `position:absolute;left:70px;top:${btnTop}px;pointer-events:auto;display:flex;gap:10px;`;
     
     const doneBtn = document.createElement('button');
     doneBtn.textContent = 'DONE';
     doneBtn.style.cssText = 'padding:10px 30px;font-size:16px;font-weight:bold;background:#00c853;color:white;border:none;border-radius:6px;cursor:pointer;';
-    doneBtn.onclick = () => {
-        window.__pw_final_targets = finalTargets;
-        window.__pw_action = 'done';
-    };
+    doneBtn.onclick = () => { window.__pw_final_targets = finalTargets; window.__pw_action = 'done'; };
 
     const plusBtn = document.createElement('button');
     plusBtn.textContent = '+ 3 Rows';
     plusBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#2196f3;color:white;border:none;border-radius:6px;cursor:pointer;';
-    plusBtn.onclick = () => {
-        window.__row_count = Math.min(9, rowCount + 3);
-        window.__pw_action = 'update';
-    };
+    plusBtn.onclick = () => { window.__row_count = Math.min(9, rowCount + 3); window.__pw_action = 'update'; };
 
     const minusBtn = document.createElement('button');
     minusBtn.textContent = '- 3 Rows';
     minusBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#ff9800;color:white;border:none;border-radius:6px;cursor:pointer;';
-    minusBtn.onclick = () => {
-        window.__row_count = Math.max(3, rowCount - 3);
-        window.__pw_action = 'update';
-    };
+    minusBtn.onclick = () => { window.__row_count = Math.max(3, rowCount - 3); window.__pw_action = 'update'; };
 
     const resetBtn = document.createElement('button');
     resetBtn.textContent = 'RESET';
     resetBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#ff3d00;color:white;border:none;border-radius:6px;cursor:pointer;';
-    resetBtn.onclick = () => {
-        window.__pw_action = 'reset';
-    };
+    resetBtn.onclick = () => { window.__pw_action = 'reset'; };
 
     btnContainer.appendChild(doneBtn);
     btnContainer.appendChild(plusBtn);
@@ -161,131 +140,147 @@ ws_state = {"up": False}
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def auto_capture_templates(page):
-    log("📸 আপনার সেট করা লাল বক্সগুলো থেকে বাটনের ছবি কেটে নেওয়া হচ্ছে...")
-    img_bytes = page.screenshot(type="png", scale="css")
-    np_arr = np.frombuffer(img_bytes, np.uint8)
-    full_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
+# ================= DONE ক্লিকের পর সেটআপ =================
+def setup_from_done(page, final_targets):
+    log("⚙️  স্ক্রিন থেকে নীল বক্স (Anchor) এবং লাল বক্সের লেখা সেভ করা হচ্ছে...")
     
-    TEMPLATES.clear()
-    for side, line, rx, ry, rw, rh in TARGET_LAYOUTS:
-        if ry + rh > full_img.shape[0] or rx + rw > full_img.shape[1] or rx < 0 or ry < 0:
-            continue
-        crop_img = full_img[ry:ry+rh, rx:rx+rw]
-        TEMPLATES[(side, line)] = {"img": crop_img, "w": rw, "h": rh}
-        log(f"   ✅ ক্যাপচারড: {side.upper()} {line} (Y: {ry})")
+    # UI মুছে ফেলা
+    page.evaluate("() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
+    page.wait_for_timeout(300)
 
-# ================= OCR Verification =================
+    # স্ক্রিনশট নেওয়া (UI ছাড়া)
+    raw = page.screenshot(type="png", scale="css")
+    np_arr = np.frombuffer(raw, np.uint8)
+    src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
+
+    # ১. নীল বক্স (Anchor) সেভ করা (UI-তে Blue box ছিল y=450, x=70, w=420, h=25)
+    anchor_img = src_img[450:475, 70:490]
+    ANCHOR_TEMPLATE.update({"img": anchor_img, "w": 420, "h": 25})
+    log("   ✅ Anchor (Blue Box) সফলভাবে সেভ হয়েছে।")
+
+    # ২. লাল বক্সগুলোর লেখা পড়া
+    MAPPED_TARGETS.clear()
+    for t in final_targets:
+        x, y, w, h = t['x'], t['y'], t['w'], t['h']
+        
+        # ওই নির্দিষ্ট লাল বক্সের জায়গার ছবি কাটা
+        crop = src_img[y:y+h, x:x+w]
+        crop_resized = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        
+        # OCR চালানো
+        text = pytesseract.image_to_string(crop_resized, config='--psm 7').lower()
+        
+        # লেখা থেকে লাইনটি আলাদা করা (যেমন: over 0.5 বা under 1.5)
+        # যেহেতু লেখায় "24 - Over, 0 - Delivery, Over 0.5" থাকে, তাই রেজেক্স দিয়ে শেষেরটা নিচ্ছি
+        matches = re.findall(r'(over|under)\s*(\d+\.?\d*)', text)
+        if matches:
+            # সাধারণত শেষের ম্যাচটাই আসল লাইন হয় (Over 0.5)
+            side, line_str = matches[-1]
+            line = float(line_str)
+            MAPPED_TARGETS.append({
+                "side": side,
+                "line": line,
+                "x": x, "y": y, "w": w, "h": h
+            })
+            log(f"      ✅ ম্যাপিং: {side.upper()} {line} সফলভাবে সেভ হয়েছে।")
+        else:
+            log(f"      ⚠️ OCR পড়তে পারেনি। লেখা ছিল: '{text.strip()[:30]}'")
+
+# ================= লাইভ ভেরিফিকেশন =================
 def verify_over_delivery(img_crop, ws_over, market_del):
     try:
         img_crop = cv2.resize(img_crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
         text = pytesseract.image_to_string(img_crop, config='--psm 7').lower()
+        clean_text = re.sub(r'[^a-z0-9]', '', text)
         
-        m = re.search(r'(\d+)\s*-?\s*over.*?(\d+)\s*-?\s*delivery', text, re.IGNORECASE)
-        
-        if m:
-            screen_over = int(m.group(1))
-            screen_del = int(m.group(2))
-            
-            if screen_over == int(ws_over) and screen_del == int(market_del):
-                return True
-            else:
-                log(f"   ⚠️ [OCR Mismatch] Screen: {screen_over}-{screen_del}, Expected: {ws_over}-{market_del}")
-        else:
-            clean_text = re.sub(r'[^a-z0-9]', '', text)
-            if str(ws_over) in clean_text and str(market_del) in clean_text:
-                return True
-            log(f"   ⚠️ [OCR Parse Error] Text: {text.strip()[:30]}...")
-            
+        # ওভার এবং ডেলিভারি নাম্বার ম্যাচিং
+        if str(ws_over) in clean_text and str(market_del) in clean_text:
+            return True
         return False
-    except Exception as e:
-        log(f"⚠️ [OCR] error: {e}")
+    except Exception:
         return False
 
-# ================= Smart Line Logic =================
-def decide_side_line(run, kind=None):
-    # ⭐ Wide এবং No Ball এর জন্য আপনার দেওয়া কাস্টম লজিক
-    if kind == 'wide':
-        if run == 1: return ("over", 0.5)
-        elif run >= 3: return ("over", 3.5)
-    elif kind == 'noball':
-        if run == 1: return ("over", 0.5)
-        elif run >= 5: return ("over", 3.5)
-        elif run >= 3: return ("over", 1.5)
-        
-    # অন্যান্য বলের জন্য স্ট্যান্ডার্ড লজিক
-    if run == 0:
-        return ("under", 0.5)
-    known_lines = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
-    best = max([ln for ln in known_lines if run > ln], default=0.5)
-    return ("over", best)
-
-# ================= স্মার্ট স্ক্রল এবং ক্লিক =================
 def process_second_push(page, ball_key, run, kind, ws_over, market_del):
-    side_want, line_want = decide_side_line(run, kind)
+    side_want = "under" if run == 0 else "over"
     
-    available_lines = [ln for (s, ln) in TEMPLATES.keys() if s == side_want]
-    if not available_lines:
-        log(f"❌ [NO-CLICK] {side_want} এর জন্য কোনো টার্গেট নেই!")
-        return False
+    if kind == 'wide':
+        if run == 1: line_want = 0.5
+        elif run >= 3: line_want = 3.5
+        else: line_want = 0.5
+    elif kind == 'noball':
+        if run == 1: line_want = 0.5
+        elif run >= 5: line_want = 3.5
+        elif run >= 3: line_want = 1.5
+        else: line_want = 0.5
+    else:
+        if run == 0: line_want = 0.5
+        else: line_want = max([ln for ln in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5] if run > ln], default=0.5)
 
-    if (side_want, line_want) not in TEMPLATES:
-        line_want = min(available_lines, key=lambda x: abs(x - line_want))
+    log(f"🎯 [TARGET] ball={ball_key} run={run} ({kind}) → {side_want} {line_want} | WS: {ws_over}-{market_del}")
 
-    log(f"🎯 [TARGET] ball={ball_key} run={run} ({kind}) → {side_want} {line_want} | Expected: {ws_over}-{market_del}")
-
-    tpl_data = TEMPLATES.get((side_want, line_want))
+    # ১. নীল বক্স (Anchor) খুঁজে আনা
+    page.evaluate(SCROLL_JS, -2000)
+    page.wait_for_timeout(300)
     
-    def try_match_and_verify():
+    anchor_found = False
+    ax, ay = 0, 0
+    
+    for _ in range(10):
         raw = page.screenshot(type="png", scale="css")
         np_arr = np.frombuffer(raw, np.uint8)
         src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
-        if src_img is None: return None
         
-        res = cv2.matchTemplate(src_img, tpl_data["img"], cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(src_img, ANCHOR_TEMPLATE["img"], cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
         
         if max_val >= COMPARE_THRESHOLD:
-            px, py = max_loc
-            w, h = tpl_data["w"], tpl_data["h"]
-            crop_img = src_img[py:py+h, px:px+w]
+            ax, ay = max_loc
+            anchor_found = True
+            break
             
-            if verify_over_delivery(crop_img, ws_over, market_del):
-                return {"x": px, "y": py, "w": w, "h": h, "score": max_val}
-            else:
-                return None
-        return None
-
-    match = try_match_and_verify()
-    
-    if not match:
-        log("   🔍 স্ক্রিনে পাইনি বা নাম্বার মিলছে না, স্ক্রল করছি...")
-        page.evaluate(SCROLL_JS, -300)
+        page.evaluate(SCROLL_JS, 300)
         page.wait_for_timeout(200)
-        match = try_match_and_verify()
-        
-        if not match:
-            page.evaluate(SCROLL_JS, 600)
-            page.wait_for_timeout(200)
-            match = try_match_and_verify()
 
-    if match:
-        log(f"   🎯 Verified & Found at ({match['x']},{match['y']}) score={match['score']:.3f}")
-        px = match['x'] + (match['w'] / 2)
-        py = match['y'] + (match['h'] / 2)
+    if not anchor_found:
+        log(f"❌ [NO-CLICK] ball={ball_key} — নীল বক্স (Anchor) পাওয়া যায়নি!")
+        return False
+
+    # ২. সঠিক লাল বক্সটি খোঁজা
+    target_box = None
+    for t in MAPPED_TARGETS:
+        if t["side"] == side_want and abs(t["line"] - line_want) < 0.01:
+            target_box = t
+            break
+
+    if not target_box:
+        log(f"❌ [NO-CLICK] ball={ball_key} — ম্যাপিং-এ {side_want} {line_want} নেই!")
+        return False
+
+    # বক্সের বর্তমান পজিশন বের করা (Anchor এর সাপেক্ষে)
+    rel_y = target_box["y"] - 475 # 475 হলো UI তে প্রথম লাল বক্সের y
+    actual_y = ay + rel_y
+    actual_x = ax + (target_box["x"] - 70) # 70 হলো UI তে নীল বক্সের x
+
+    # ৩. ভেরিফিকেশন (লেখা মিলছে কিনা)
+    crop = src_img[actual_y:actual_y+target_box["h"], actual_x:actual_x+target_box["w"]]
+    
+    if verify_over_delivery(crop, ws_over, market_del):
+        center_x = actual_x + (target_box["w"] / 2)
+        center_y = actual_y + (target_box["h"] / 2)
         
+        log(f"   🎯 Verified! Clicking at ({center_x},{center_y})")
         try:
-            page.mouse.move(px, py)
+            page.mouse.move(center_x, center_y)
             page.wait_for_timeout(random.randint(20, 50))
             page.mouse.down()
             page.wait_for_timeout(random.randint(15, 40))
             page.mouse.up()
-            log(f"✅ [CLICK] ball={ball_key} at ({px:.0f},{py:.0f})")
+            log(f"✅ [CLICK] ball={ball_key}")
         except Exception as e:
             log(f"⚠️ [CLICK] error: {e}")
         return True
     else:
-        log(f"❌ [NO-CLICK] ball={ball_key} — সঠিক বাটনটি পাওয়া যায়নি বা নাম্বার মেলেনি।")
+        log(f"   ⚠️ [OCR Mismatch] বাটন পাওয়া গেছে কিন্তু নাম্বার মেলেনি।")
         return False
 
 # ================= WebSocket & Parsers =================
@@ -384,8 +379,7 @@ def monitor_and_click():
 
         print("\n" + "="*65)
         print("👉 ব্রাউজারে গিয়ে ম্যানুয়ালি 'Quick Events' সিলেক্ট করুন।")
-        print("👉 ব্লু বক্সের নিচে থাকা লাল বক্সগুলোতে আসল বাটনগুলো এডজাস্ট করুন।")
-        print("👉 প্রয়োজন হলে + বা - ক্লিক করে রো কমবেশি করুন।")
+        print("👉 নীল বক্সের নিচে লাল বক্সগুলো এডজাস্ট করুন।")
         print("👉 সব ঠিক থাকলে 'DONE' বাটনে ক্লিক করুন।")
         print("="*65 + "\n")
 
@@ -402,22 +396,9 @@ def monitor_and_click():
 
             if action == 'done':
                 final_targets = page.evaluate("() => window.__pw_final_targets")
-                rows = len(final_targets) // 2
                 
-                print(f"\n👉 আপনি {rows}টি রো সিলেক্ট করেছেন।")
-                lines_input = input(f"👉 এই {rows}টি রো-এর লাইন নাম্বারগুলো কমা দিয়ে লিখুন (যেমন: 0.5, 1.5, 3.5): ").strip()
-                try:
-                    lines_list = [float(x.strip()) for x in lines_input.split(",")]
-                    if len(lines_list) < rows:
-                        lines_list += [lines_list[-1] + 1.0] * (rows - len(lines_list))
-                except Exception:
-                    lines_list = [i * 1.0 + 0.5 for i in range(rows)]
-                
-                TARGET_LAYOUTS.clear()
-                for i, t in enumerate(final_targets):
-                    row_idx = i // 2
-                    line = lines_list[row_idx]
-                    TARGET_LAYOUTS.append((t['side'], line, t['x'], t['y'], t['w'], t['h']))
+                # ⭐ DONE দেওয়ার সাথে সাথে অটো-রিডিং হবে
+                setup_from_done(page, final_targets)
                 break
             elif action == 'reset':
                 page.evaluate("() => { window.__row_count = 3; }")
@@ -425,22 +406,15 @@ def monitor_and_click():
             elif action == 'update':
                 continue
 
-        page.evaluate("() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
-        page.wait_for_timeout(300)
-
-        auto_capture_templates(page)
-
-        if not TEMPLATES:
-            log("⚠️ কোনো টার্গেট ক্যাপচার হয়নি — স্ক্রিপ্ট বন্ধ।")
-            browser.close()
-            return
+        if not MAPPED_TARGETS:
+            log("⚠️ কোনো টার্গেট ম্যাপিং করা যায়নি — স্ক্রিপ্ট বন্ধ।")
+            browser.close(); return
 
         start_ws_thread()
         log(f"👂 [WS] wait korchi... (match_key={match_filter})\n")
 
         remember_seen, was_seen, forget_seen = make_seen_lru(300)
         
-        # ⭐ ডাইনামিক ডেলিভারি কাউন্টারের জন্য ভেরিয়েবল
         last_ws_over = None
         market_del_counter = 0
 
@@ -470,7 +444,6 @@ def monitor_and_click():
                     ws_over, ws_del_legal = get_over_delivery(d)
                     if not ws_over: continue
                     
-                    # ⭐ Smart Push Counter (Legal, Wide, No Ball সবই ১টি ডেলিভারি হিসেবে গোনা হবে)
                     if last_ws_over is None:
                         last_ws_over = ws_over
                         market_del_counter = ws_del_legal
