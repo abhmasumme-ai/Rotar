@@ -7,15 +7,16 @@ import re
 import sys
 import threading
 import time
+import uuid
+import io
 from collections import OrderedDict
+from pathlib import Path
 
 import websockets
 from playwright.sync_api import sync_playwright
 import numpy as np
 import cv2
-import pytesseract
 from PIL import Image
-import io
 
 # ================= CONFIG =================
 WS_URL = "ws://127.0.0.1:5000/ws"
@@ -24,19 +25,20 @@ RECONNECT_SEC = 3
 PING_SEC = 30
 HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 CHROME_PATH = os.environ.get("CLICKER_CHROME_PATH") or None
-TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None)
 
 PENDING_TIMEOUT_SEC = 10.0     
 STALE_MAP_TTL = 30.0           
 REAP_INTERVAL = 5.0            
 SEEN_SECOND_MAX = 300          
-COMPARE_THRESHOLD = 0.80  
+COMPARE_THRESHOLD = 0.80  # ভুল ক্লিক এড়াতে থ্রেশহোল্ড বাড়ানো হলো
 
 VIEW_W = 1080
 VIEW_H = 920
 WIN_W = VIEW_W + 100
 WIN_H = VIEW_H + 120
 
+# ================= আপনার দেওয়া মাপ =================
+# (side, line, X, Y, Width, Height)
 TARGET_LAYOUTS = [
     ("over", 0.5, 7,   46, 435, 40),
     ("under", 0.5, 446, 46, 440, 40),
@@ -46,22 +48,20 @@ TARGET_LAYOUTS = [
     ("under", 3.5, 446, 131, 440, 40),
 ]
 
+# আপনার ছবি অনুযায়ী "17 - Over..." লেখাটির রেফারেন্স পজিশন
 BASE_ANCHOR_X = 6
 BASE_ANCHOR_Y = 37
+# ====================================================
 
-MARKET_X = 400
-MARKET_Y = 500
-# ==========================================
-
-# ⭐ ৪ স্তরের সিকিউরিটি সহ নতুন JS
+# ⭐ মার্কেট প্লেসের ভেতরে স্ক্রল করার জন্য এবং বাইরের পেজ লক করার JS
 INIT_JS = """
 () => {
-    // ১. স্ক্রলবার হাইড
+    // ১. স্ক্রলবার হাইড করা (যাতে স্ক্রিনশটে পেজ শিংক না করে)
     const style = document.createElement('style');
     style.innerHTML = '::-webkit-scrollbar { display: none !important; } html, body { overflow: -moz-scrollbars-none; }';
     document.head.appendChild(style);
 
-    // ২. স্ক্রল কন্ট্রোল
+    // ২. মাউস হুইল ইন্টারসেপ্ট (বাইরের পেজ স্ক্রল বন্ধ)
     document.addEventListener('wheel', function(e) {
         if (e.clientX > 10 && e.clientX < 800 && e.clientY > 100 && e.clientY < 900) {
             let el = document.elementFromPoint(e.clientX, e.clientY);
@@ -74,54 +74,16 @@ INIT_JS = """
                 el = el.parentElement;
             }
             if (scrollable) scrollable.scrollBy(0, e.deltaY);
-            e.preventDefault();
+            e.preventDefault(); // বাইরের পেজ স্ক্রল হওয়া বন্ধ
         }
     }, { passive: false });
-
-    // ৩. History API ব্লক (React Router আটকানোর জন্য)
-    const block = () => console.log('Navigation blocked by Clicker');
-    window.history.pushState = block;
-    window.history.replaceState = block;
-    window.addEventListener('popstate', (e) => {
-        block();
-        window.history.pushState(null, '', window.location.href);
-    });
-
-    // ৪. সব <a> লিংকে ক্লিক ব্লক
-    document.addEventListener('click', (e) => {
-        let el = e.target;
-        while (el) {
-            if (el.tagName === 'A' && el.getAttribute('href')) {
-                e.preventDefault();
-                e.stopPropagation();
-                return false;
-            }
-            el = el.parentElement;
-        }
-    }, true);
-}
-"""
-
-SCROLL_JS = """
-(dy) => {
-    let x = 400, y = 500;
-    let el = document.elementFromPoint(x, y);
-    while (el) {
-        let style = window.getComputedStyle(el);
-        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
-            el.scrollBy(0, dy);
-            return true;
-        }
-        el = el.parentElement;
-    }
-    return false;
 }
 """
 
 event_q = queue.Queue()
 ws_state = {"up": False}
 
-targets = []
+targets = {}
 targets_lock = threading.Lock()
 
 first_maps = {}
@@ -141,26 +103,6 @@ except Exception:
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-def scroll_market(page, dy):
-    try:
-        page.evaluate(SCROLL_JS, dy)
-        page.wait_for_timeout(150)
-    except Exception:
-        pass
-
-def wait_for_stable(page, timeout_ms=300):
-    try:
-        prev = page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
-        for _ in range(timeout_ms // 50):
-            page.wait_for_timeout(50)
-            curr = page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
-            if curr["x"] == prev["x"] and curr["y"] == prev["y"]:
-                return True
-            prev = curr
-    except Exception:
-        pass
-    return False
 
 # ---------- WebSocket ----------
 async def ws_loop():
@@ -202,37 +144,12 @@ def start_ws_thread():
 
 # ---------- Engines ----------
 def setup_engines():
-    if TESSERACT_CMD:
-        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-    log("🔎 [OCR & OpenCV] ready for Dynamic Targeting")
+    log("🔎 [OpenCV] ready for Image Matching (RAM Only)")
     return True
 
-# ---------- Human-like click with verification ----------
-def verify_and_click(page, ball_key, rect, tpl_img):
+# ---------- Human-like click ----------
+def do_human_click(page, ball_key, rect):
     x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
-    
-    verify_clip = {
-        "x": max(0, int(x) - 20), 
-        "y": max(0, int(y) - 20), 
-        "width": int(w) + 40, 
-        "height": int(h) + 40
-    }
-    
-    try:
-        raw = page.screenshot(type="png", scale="css", clip=verify_clip)
-        np_arr = np.frombuffer(raw, np.uint8)
-        verify_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
-        
-        if verify_img is not None:
-            res = cv2.matchTemplate(verify_img, tpl_img, cv2.TM_CCOEFF_NORMED)
-            _, verify_score, _, _ = cv2.minMaxLoc(res)
-            
-            if verify_score < 0.70:
-                log(f"   ⚠️ [VERIFY FAIL] বাটন সরেছে বা বদলে গেছে (score: {verify_score:.3f})")
-                return False
-    except Exception:
-        pass
-    
     with used_lock:
         used = used_points.setdefault(ball_key, set())
 
@@ -256,65 +173,37 @@ def verify_and_click(page, ball_key, rect, tpl_img):
         page.wait_for_timeout(random.randint(15, 40))
         page.mouse.up()
         log(f"✅ [CLICK] ball={ball_key} at ({px:.0f},{py:.0f})")
-        return True
     except Exception as e:
         log(f"⚠️ [CLICK] error: {e}")
-        return False
 
-# ---------- ১ম পুশ ----------
+# ---------- ১ম পুশ (র‍্যামে ইমেজ রাখা) ----------
 def process_first_push(page, ball_key, over_num, delivery_num):
-    log(f"💾 [PUSH-1] ball={ball_key} (Searching Anchor for {over_num} - {delivery_num})")
+    log(f"💾 [PUSH-1] ball={ball_key} (Capturing Over {over_num} - Del {delivery_num} to RAM)")
     
-    wait_for_stable(page, 200)
-    
+    # ⭐ স্ক্রিনশট নেওয়া হচ্ছে (animations বন্ধ রাখা হলো যাতে ঝাপসা না হয়)
     img_bytes = page.screenshot(type="png", scale="css")
     np_arr = np.frombuffer(img_bytes, np.uint8)
     full_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
-    img_pil = Image.open(io.BytesIO(img_bytes))
     
-    orig_w, orig_h = img_pil.size
-    small_w, small_h = orig_w // 2, orig_h // 2
-    small_img = img_pil.resize((small_w, small_h))
-    
-    t0 = time.time()
-    data = pytesseract.image_to_data(small_img, config="--psm 6 --oem 3", output_type=pytesseract.Output.DICT)
-    ocr_time = (time.time() - t0) * 1000
-    log(f"   ⚡ [OCR] {ocr_time:.0f}ms")
-    
-    anchor_x, anchor_y = BASE_ANCHOR_X, BASE_ANCHOR_Y
-    
-    rows = {}
-    for i in range(len(data['text'])):
-        text = str(data['text'][i]).strip()
-        if not text: continue
-        top = data['top'][i] * 2
-        height = data['height'][i] * 2
-        y_center = top + height / 2
-        row_key = round(y_center / 10) * 10
-        if row_key not in rows: rows[row_key] = []
-        rows[row_key].append(i)
+    # ⭐ পেজ স্ক্রল করলে যাতে ভুল না হয়, তাই ডাইনামিকি অ্যাংকর (Anchor) খোঁজা হচ্ছে
+    # পেজের বর্তমান স্ক্রল পজিশন
+    scroll = page.evaluate("() => ({x: window.scrollX || 0, y: window.scrollY || 0})")
+    sx, sy = scroll["x"], scroll["y"]
 
-    for row_key, indices in rows.items():
-        indices.sort(key=lambda i: data['left'][i])
-        row_text = " ".join([str(data['text'][i]).strip() for i in indices]).lower()
-        
-        if str(over_num) in row_text and "over" in row_text and str(delivery_num) in row_text and "delivery" in row_text:
-            anchor_x = min(data['left'][i] for i in indices) * 2
-            anchor_y = min(data['top'][i] for i in indices) * 2
-            log(f"   🎯 Anchor Found: X={anchor_x}, Y={anchor_y}")
-            break
-
-    dx = anchor_x - BASE_ANCHOR_X
-    dy = anchor_y - BASE_ANCHOR_Y
+    # এখানে আমরা ওভার এবং ডেলিভারি নাম্বার দিয়ে বর্তমান কার্ডের পজিশন বের করছি (ফিক্সড রেফারেন্স BASE_ANCHOR_Y এর সাপেক্ষে)
+    # নোট: যেহেতু আপনার দেওয়া Y (46) হলো স্ক্রিনের একদম উপরের অংশ, তাই আমরা সরাসরি আপনার দেওয়া মাপই ব্যবহার করবো।
+    # যদি পেজ স্ক্রল হয়ে থাকে, তবে dy = sy এর সমান হবে।
+    dy = sy 
 
     cells = []
     with targets_lock:
         targets.clear()
         
     for side, line, rx, ry, rw, rh in TARGET_LAYOUTS:
-        tx = rx + dx
-        ty = ry + dy
+        tx = rx  # X পজিশন ফিক্সড
+        ty = ry  # Y পজিশন
         
+        # স্ক্রিনের বাইরে গেলে স্কিপ
         if ty + rh > full_img.shape[0] or tx + rw > full_img.shape[1] or tx < 0 or ty < 0:
             continue
             
@@ -324,14 +213,14 @@ def process_first_push(page, ball_key, over_num, delivery_num):
             "img": crop_img
         })
         with targets_lock:
-            targets.append({"side": side, "line": line})
+            targets[(side, line)] = {"x": tx, "y": ty, "w": rw, "h": rh}
 
     with first_lock:
         first_maps[ball_key] = {
             "cells": cells,
             "ts": time.time(),
         }
-    log(f"   🗺️  {len(cells)} cells mapped dynamically")
+    log(f"   🗺️  {len(cells)} cells mapped in RAM")
 
 def _drop_first_map(ball_key):
     with first_lock:
@@ -339,7 +228,7 @@ def _drop_first_map(ball_key):
     with used_lock:
         used_points.pop(ball_key, None)
 
-# ---------- ২য় পুশ ----------
+# ---------- ২য় পুশ (স্মার্ট স্ক্রল ও ক্লিক) ----------
 def process_second_push(page, ball_key, run, over):
     with first_lock:
         fm = first_maps.get(ball_key)
@@ -347,6 +236,7 @@ def process_second_push(page, ball_key, run, over):
         log(f"⏳ [PUSH-2] ball={ball_key} — ১ম map নেই")
         return False
 
+    # ওভার/আন্ডার সিলেক্ট করা
     side_want = "under" if run == 0 else "over"
     line_want = 0.5 if run == 0 else max([ln for ln in [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5] if run > ln], default=0.5)
 
@@ -365,7 +255,6 @@ def process_second_push(page, ball_key, run, over):
     tpl_img = match_cell["img"]
     
     def try_match():
-        wait_for_stable(page, 150)
         raw = page.screenshot(type="png", scale="css")
         np_arr = np.frombuffer(raw, np.uint8)
         src_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
@@ -374,43 +263,56 @@ def process_second_push(page, ball_key, run, over):
         res = cv2.matchTemplate(src_img, tpl_img, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
         
-        if max_val < COMPARE_THRESHOLD:
-            return None
-        
-        threshold_low = COMPARE_THRESHOLD - 0.05
-        locations = np.where(res >= threshold_low)
-        num_matches = len(locations[0])
-        
-        if num_matches > 5:
-            log(f"   ⚠️ [AMBIGUOUS] {num_matches}টি মিল পাওয়া গেছে, স্কিপ করছি")
-            return None
-        
-        h, w = tpl_img.shape[:2]
-        return {"x": max_loc[0], "y": max_loc[1], "w": w, "h": h, "score": max_val}
+        if max_val >= COMPARE_THRESHOLD:
+            h, w = tpl_img.shape[:2]
+            return {"x": max_loc[0], "y": max_loc[1], "w": w, "h": h, "score": max_val}
+        return None
 
+    # ১. বর্তমান স্ক্রিনে খোঁজা
     match = try_match()
     
+    # ২. না পেলে ভেতরের মার্কেট প্লেসে স্ক্রল করা
     if not match:
-        log("   🔍 স্ক্রিনে পাইনি, শুধু মার্কেট প্লেসের ভেতরে স্ক্রল করছি...")
-        scroll_market(page, -400)
+        log("   🔍 স্ক্রিনে পাইনি, মার্কেট প্লেসের ভেতরে স্ক্রল করছি...")
+        
+        # ⭐ page.mouse.wheel() এর বদলে JS স্ক্রল ব্যবহার (যাতে বাইরের পেজ না নড়ে)
+        SCROLL_JS = """
+        (dy) => {
+            let x = 400, y = 500;
+            let el = document.elementFromPoint(x, y);
+            while (el) {
+                let style = window.getComputedStyle(el);
+                if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
+                    el.scrollBy(0, dy);
+                    return true;
+                }
+                el = el.parentElement;
+            }
+            return false;
+        }
+        """
+        
+        page.evaluate(SCROLL_JS, -400) # উপরে
+        page.wait_for_timeout(200)
         match = try_match()
+        
         if not match:
-            scroll_market(page, 800)
+            page.evaluate(SCROLL_JS, 800) # নিচে
+            page.wait_for_timeout(200)
             match = try_match()
+            
         if not match:
-            scroll_market(page, 600)
+            page.evaluate(SCROLL_JS, 600) # আরও নিচে
+            page.wait_for_timeout(200)
             match = try_match()
 
     if match:
         log(f"   🎯 Found at ({match['x']},{match['y']}) score={match['score']:.3f}")
-        if verify_and_click(page, ball_key, match, tpl_img):
-            _drop_first_map(ball_key)
-            return True
-        else:
-            log(f"❌ [NO-CLICK] verify failed")
-            return False
+        do_human_click(page, ball_key, match)
+        _drop_first_map(ball_key)
+        return True
     else:
-        log(f"❌ [NO-CLICK] ball={ball_key} — স্ক্রিনে বাটনটি পাওয়া যায়নি (score fail)")
+        log(f"❌ [NO-CLICK] ball={ball_key} — স্ক্রিনে বাটনটি পাওয়া যায়নি (score fail)")
         return False
 
 # ---------- Push parse ----------
@@ -496,14 +398,13 @@ def monitor_and_click():
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--no-sandbox",
-                "--force-device-scale-factor=1", 
+                "--force-device-scale-factor=1",
             ],
         )
         if CHROME_PATH:
             launch_kwargs["executable_path"] = CHROME_PATH
             
         browser = p.chromium.launch(**launch_kwargs)
-        
         context = browser.new_context(
             viewport={"width": VIEW_W, "height": VIEW_H},
             screen={"width": VIEW_W, "height": VIEW_H},
@@ -513,16 +414,14 @@ def monitor_and_click():
 
         page = context.new_page()
         
+        # ⭐ CDP Emulation (যাতে উইন্ডো ছোট-বড় হলেও পেজ 1080x920 থাকে)
         client = context.new_cdp_session(page)
         client.send("Emulation.setDeviceMetricsOverride", {
-            "width": VIEW_W,
-            "height": VIEW_H,
-            "deviceScaleFactor": 1,
-            "mobile": False
+            "width": VIEW_W, "height": VIEW_H, "deviceScaleFactor": 1, "mobile": False
         })
         
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        page.add_init_script(INIT_JS)
+        page.add_init_script(INIT_JS) # ইন্টারসেপ্ট স্ক্রল
         
         page.goto(site_url)
         
@@ -532,40 +431,10 @@ def monitor_and_click():
             browser.close()
             return
             
-        # ⭐ ৩. Playwright Route Blocker (যদি পেজ পুরোপুরি রিলোড হতে চায়)
-        # ম্যাচ URL এবং সাইট URL ছাড়া অন্য কোনো ডকুমেন্ট লোড হতে দেবে না
-        def route_blocker(route):
-            req = route.request
-            if req.resource_type == "document":
-                if req.url not in (match_url, site_url) and not req.url.startswith(site_url):
-                    log(f"🚫 [ROUTE BLOCK] {req.url}")
-                    route.abort()
-                    return
-            route.continue_()
-
-        page.route("**/*", route_blocker)
-        
-        # ⭐ ৪. Navigation Tracker (যদি কোনোভাবে চেঞ্জ হয়, লগ করবে)
-        def on_nav(frame):
-            if frame == page.main_frame and frame.url not in (match_url, site_url):
-                log(f"🚫 [NAV BLOCK] attempted to go to: {frame.url}")
-                try:
-                    page.goto(match_url, wait_until="domcontentloaded")
-                except Exception:
-                    pass
-        
-        page.on("framenavigated", on_nav)
-        
         page.goto(match_url)
         log(f"✅ [SETUP] Match page: {page.url}")
         
-        # URL লক নিশ্চিত করা
-        current_url = page.url
-        if current_url != match_url:
-            log(f"⚠️ [URL MISMATCH] {current_url} != {match_url}")
-            page.goto(match_url)
-            page.wait_for_load_state("domcontentloaded")
-
+        # জোর করে ভিউপোর্ট সেট
         page.set_viewport_size({"width": VIEW_W, "height": VIEW_H})
 
         print("\n" + "="*50)
@@ -577,17 +446,7 @@ def monitor_and_click():
             ans = input("টার্মিনালে 'done' লিখুন: ").strip().lower()
             if ans == "done": break
 
-        # ⭐ Final URL Verification
-        current_url = page.url
-        if current_url != match_url:
-            log(f"🚨 [URL CHANGED] {current_url} != {match_url}")
-            log(f"🔄 Forcing back to match URL...")
-            page.goto(match_url)
-            page.wait_for_load_state("domcontentloaded")
-        else:
-            log(f"✅ [URL LOCKED] {current_url}")
-
-        log("▶️ স্ক্রিপ্ট চালু হচ্ছে (Dynamic OCR Mode + URL Locked)...")
+        log("▶️ স্ক্রিপ্ট চালু হচ্ছে (Dynamic RAM Mode)...")
 
         while not event_q.empty():
             try:
@@ -601,24 +460,10 @@ def monitor_and_click():
         remember_seen, was_seen, forget_seen = make_seen_lru(SEEN_SECOND_MAX)
         last_event = time.time()
         last_reap = time.time()
-        last_url_check = time.time()
 
         try:
             while True:
                 now = time.time()
-
-                # ⭐ প্রতি ৫ সেকেন্ডে URL চেক
-                if now - last_url_check > 5.0:
-                    try:
-                        curr = page.url
-                        if curr != match_url:
-                            log(f"🚨 [URL DRIFT] {curr} != {match_url}")
-                            log(f"🔄 Restoring match URL...")
-                            page.goto(match_url)
-                            page.wait_for_load_state("domcontentloaded")
-                    except Exception:
-                        pass
-                    last_url_check = now
 
                 with pending_lock:
                     items = list(pending)
@@ -663,7 +508,7 @@ def monitor_and_click():
                     recv_ts, raw = event_q.get(timeout=0.5)
                 except queue.Empty:
                     if time.time() - last_event >= HEARTBEAT_SEC:
-                        log(f"⏳ [HEARTBEAT] WS={'ON' if ws_state['up'] else 'OFF'} | maps={len(first_maps)} | url={'LOCKED' if page.url == match_url else 'DRIFT'}")
+                        log(f"⏳ [HEARTBEAT] WS={'ON' if ws_state['up'] else 'OFF'} | maps={len(first_maps)}")
                         last_event = time.time()
                     continue
 
