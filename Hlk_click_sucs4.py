@@ -165,7 +165,7 @@ def setup_from_done(page, final_targets):
     MAPPED_TARGETS.clear()
     max_del = 0
     
-    # ⭐ এখানে পরিবর্তন করা হয়েছে: শুধুমাত্র প্রথম ৩টি রো (৬টি বক্স) ম্যাপ হবে
+    # ⭐ শুধুমাত্র প্রথম ৩টি রো (৬টি বক্স) ম্যাপ হবে
     max_boxes = TARGET_ROWS * 2 
     for t in final_targets[:max_boxes]:
         x, y, w, h = int(t['x']), int(t['y']), int(t['w']), int(t['h'])
@@ -513,17 +513,28 @@ def monitor_and_click():
                     ws_over, ws_del_legal = get_over_delivery(d)
                     if not ws_over: continue
                     
+                    text, kind, run = ball_info(d) # ⭐ kind এখানে বের করা হলো
+                    
+                    # ⭐ Smart Sync Logic (মাঝখানে স্ক্রিপ্ট চালু করলে ভুল ক্লিক ও মিস রোধ করতে)
                     if last_ws_over is None:
                         last_ws_over = ws_over
+                        if kind in ('wide', 'noball'):
+                            market_del_counter += 1
+                        elif ws_del_legal > market_del_counter:
+                            market_del_counter = ws_del_legal
+                            
                     elif ws_over != last_ws_over:
                         last_ws_over = ws_over
                         market_del_counter = 1
+                        if ws_del_legal > market_del_counter:
+                            market_del_counter = ws_del_legal
                         last_anchor_pos = None 
                         CALIBRATED_ANCHOR_POS = None
                     else:
                         market_del_counter += 1
+                        if ws_del_legal > market_del_counter:
+                            market_del_counter = ws_del_legal
                     
-                    text, kind, run = ball_info(d)
                     log(f"🏏 [PUSH-2] ball={bkey} over={ws_over}.{market_del_counter} {text} run={run}")
                     
                     process_second_push(page, bkey, run, kind, ws_over, market_del_counter)
