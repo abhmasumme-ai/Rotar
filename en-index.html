@@ -1,1 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cricket Control Panel</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link rel="stylesheet" href="index.css">
+</head>
+<body>
 
+<header>
+  <div class="brand"><i class="fa-solid fa-display"></i> Control panel</div>
+  <div class="ctrl">
+    <div>Auto<button id="bAuto" title="Auto"><i class="fa-solid fa-gauge-simple-high"></i></button></div>
+    <div>Restart<button id="bRestart" title="Restart"><i class="fa-solid fa-arrows-rotate"></i></button></div>
+    <div>Stop<button id="bStop" title="Stop"><i class="fa-solid fa-power-off"></i></button></div>
+  </div>
+</header>
+
+<div class="layout">
+  <section class="admin-section">
+    <div>
+      <div class="tag"><i class="fa-solid fa-gear"></i> Admin</div>
+      <form class="box" id="adminForm" autocomplete="off">
+        <label for="matchKey">MATCH KEY</label><input id="matchKey" name="matchId" readonly>
+        <label for="type">MATCH FORMAT</label><input id="type" name="type" readonly>
+        <button type="button" id="activeBtn" class="active-btn">NO ACTIVE MATCH</button>
+
+        <label for="site">WEBSITE URL</label><input id="site" name="site">
+        <label for="match">MATCH URL</label><input id="match" name="match">
+        <div class="two">
+          <div>
+            <label for="over05">0.5 RUN OVER</label><input id="over05" name="over05">
+            <label for="over23">2/3 RUN OVER</label><input id="over23" name="over23">
+            <label for="bat">BATSMAN UNDER</label><input id="bat" name="bat">
+          </div>
+          <div>
+            <label for="under05">0.5 RUN UNDER</label><input id="under05" name="under05">
+            <label for="b46">4/6 BOUNDARY</label><input id="b46" name="b46">
+            <label for="wk">WICKET IN FALL</label><input id="wk" name="wk">
+          </div>
+        </div>
+        <div class="btns">
+          <button type="submit" class="submit">Submit</button>
+          <button type="button" class="edit" data-edit="adminForm"><i class="fa-solid fa-pen"></i> Edit</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <div class="divider"></div>
+
+  <div class="right-area">
+    <div class="left-stack">
+      <div>
+        <div class="tag"><i class="fa-solid fa-video"></i> Viewport</div>
+        <div class="viewport">
+          <div>
+            <div class="match-teams" id="matchTeams">-- vs --</div>
+            <div class="team" id="team">--</div>
+            <div class="score" id="score">0 - 0</div>
+            <div class="over" id="overTxt">0.0 OVER</div>
+          </div>
+          <div class="vp-right">
+            <div class="status" id="status">Waiting for data...</div>
+            <div class="ball" id="ball"><span>-</span></div>
+            <div class="overbar">
+              <div class="overno" id="overNo">-- OVER</div>
+              <div class="overdots" id="overDots"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="tag"><i class="fa-regular fa-file-lines"></i> Fixture</div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr><th>MATCH KEY</th><th>TEAMS NAME</th><th>MATCH FORMAT</th><th>STATUS</th></tr>
+            </thead>
+            <tbody id="fixture"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <div class="tag"><i class="fa-solid fa-terminal"></i> Terminal</div>
+        <ul class="terminal" id="terminal"></ul>
+      </div>
+    </div>
+
+    <div class="right-sidebar">
+      <div>
+        <div class="tag"><i class="fa-regular fa-hand-pointer"></i> Event movement</div>
+        <div class="bars">
+          <div class="bar"><span id="barClickTxt">0ms</span><i id="barClick" style="height:20px;background:var(--yellow)"></i>Click</div>
+          <div class="bar"><span id="barOddsTxt">0ms</span><i id="barOdds" style="height:20px;background:var(--cyan)"></i>Odds</div>
+        </div>
+      </div>
+
+      <div>
+        <div class="tag"><i class="fa-solid fa-temperature-full"></i> Indicator</div>
+        <div class="rings" id="rings"></div>
+      </div>
+
+      <div>
+        <div class="tag"><i class="fa-regular fa-clock"></i> Latency</div>
+        <div class="latency">
+          <canvas id="latChart" width="110" height="110"></canvas>
+          <div class="legend">
+            <div>R<span style="background:var(--red)"></span><b id="lgR"></b></div>
+            <div>B<span style="background:var(--cyan)"></span><b id="lgB"></b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
